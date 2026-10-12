@@ -99,13 +99,26 @@ fn check(name: &str, actual_raw: &str) {
         return;
     }
 
-    let expected = fs::read_to_string(&path).unwrap_or_else(|_| {
-        panic!(
-            "missing golden file {}\n\n\
+    // ⚠️ **Both sides, not just one.** `normalise` runs `raw.lines()`, which
+    // strips `\r\n` as readily as `\n` and rejoins with `\n` — so `actual` was
+    // always LF while `expected` came straight off disk. On a Windows checkout
+    // (`core.autocrlf=true`) that asymmetry alone fails all ten of these, with
+    // a diff that looks like a content change and is not.
+    //
+    // ⓘ `.gitattributes` is the real fix and pins the fixtures to LF. This is
+    // here because a one-sided comparison is a latent trap on any platform, and
+    // because it makes the failure mode impossible rather than merely unlikely.
+    // Nothing is lost: these files are JSON, YAML and SARIF that the binary
+    // emits with `\n`, so a CRLF in one is never intentional.
+    let expected = fs::read_to_string(&path)
+        .map(|s| normalise(&s))
+        .unwrap_or_else(|_| {
+            panic!(
+                "missing golden file {}\n\n\
              Create it with:  UPDATE_GOLDEN=1 cargo test --all-features --test golden_output",
-            path.display()
-        )
-    });
+                path.display()
+            )
+        });
 
     assert_eq!(
         expected, actual,
@@ -300,12 +313,60 @@ fn convert_yaml_is_stable() {
     check("convert.yaml", &stdout_of(&d, &["convert", "--to", "yaml"]));
 }
 
+/// ⚠️ **Unix only, and the golden file is the Unix contract.**
+///
+/// `doctor`'s `file_permissions` check is the one thing here that is
+/// legitimately platform-specific: file modes are a Unix concept, so on
+/// Windows the check correctly reports *"Skipped: Windows platform"* at `info`
+/// with `details: null` and `fixable: false`, which also moves three numbers in
+/// the summary. That is right behaviour, not drift — pinning it to one golden
+/// file would mean asserting that one of the two platforms is wrong.
+///
+/// ⛔ Windows is **not** left unpinned; it has its own assertion below.
 #[test]
+#[cfg(unix)]
 fn doctor_json_is_stable() {
     let d = fixture();
     check(
         "doctor.json",
         &stdout_with_env(&d, &["doctor"], "EVNX_OUTPUT_JSON", "1"),
+    );
+}
+
+/// The Windows half of the contract above.
+///
+/// ⓘ Narrower than a golden file on purpose: what matters is that the check
+/// still *appears* and says why it did nothing. A check that silently vanished
+/// on a platform would leave `doctor` quietly reporting less than it claims,
+/// and the summary counts would still add up.
+#[test]
+#[cfg(windows)]
+fn doctor_reports_permissions_as_skipped_on_windows() {
+    let d = fixture();
+    let out = stdout_with_env(&d, &["doctor"], "EVNX_OUTPUT_JSON", "1");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("doctor emits JSON");
+
+    let check = v["checks"]
+        .as_array()
+        .expect("checks is an array")
+        .iter()
+        .find(|c| c["name"] == "file_permissions")
+        .expect("the permissions check must still be listed, not dropped");
+
+    assert_eq!(
+        check["severity"], "info",
+        "skipping is not a warning: {check}"
+    );
+    assert!(
+        check["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Skipped"),
+        "the check must say it was skipped and why: {check}"
+    );
+    assert_eq!(
+        check["fixable"], false,
+        "nothing can be fixed about a check that did not run: {check}"
     );
 }
 

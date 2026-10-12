@@ -25,12 +25,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ⛔ `windows-latest` added 2026-10-13. Until then **no test in this repo had
+  # ever run on Windows**, and a Windows-only defect shipped because of it: the
+  # scanner's directory exclusions were forward-slash substrings matched against
+  # `to_string_lossy()`, so none of `.git/`, `node_modules/`, `target/`, `dist/`
+  # or `build/` ever fired there (#146).
+  #
+  # ⚠️ `fail-fast: false` so one platform's failure does not cancel the others.
+  # The default would hide a Linux regression behind a Windows one while this
+  # platform is still being brought up.
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -43,6 +53,31 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       
+      # ⛔ **The debug binary does not fit Windows' default main-thread stack.**
+      #
+      # Windows reserves **1 MB** for the main thread; Linux gives 8 MB. A debug
+      # build of this CLI needs somewhere between 1 MB and 1.5 MB just to start
+      # — measured by bisecting `ulimit -s` on Linux, where 1024 KB aborts and
+      # 1536 KB succeeds. So on Windows `evnx.exe --version` overflows before
+      # any command runs, and every integration test that spawns the binary
+      # fails with STATUS_STACK_OVERFLOW (0xC00000FD).
+      #
+      # ⓘ **Users are not affected and this is not a product bug.** The release
+      # build runs fine in **256 KB** — a twentieth of what Windows gives it —
+      # and `release.yml` ships `--release`. What costs the stack is debug-mode
+      # frame bloat in clap's command tree, not anything the program does: the
+      # overflow happens during argument parsing, which is why even `--version`
+      # dies.
+      #
+      # ⚠️ Set here rather than in `.cargo/config.toml`, which is **gitignored**
+      # on purpose so contributors can keep local overrides. A Windows
+      # contributor hitting this locally wants the same flag in that file; see
+      # CONTRIBUTING.
+      - name: Give Windows a Linux-sized main stack
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTFLAGS=-C link-arg=/STACK:8388608" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: cargo test --all-features
 
