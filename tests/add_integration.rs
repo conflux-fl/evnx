@@ -552,7 +552,7 @@ fn every_refusal_exits_2_and_writes_nothing() {
             "--yes",
         ],
         &["add", "framework", "--language", "python", "nope", "--yes"],
-        &["add", "framework", "nextjs", "--yes"],
+        &["add", "framework", "nope", "--yes"],
         &["add", "blueprint", "nope", "--yes"],
         &["add"],
     ] {
@@ -731,20 +731,39 @@ fn known_n11b_blueprint_misses_a_conflict_in_env() {
     );
 }
 
-/// I-017 (AD-C): `add framework` needs `--language`, though framework ids are
-/// unique across languages.
+/// I-017 (fixed in 0.10.2, AD-C; was `known_i017_*`): `--language` is
+/// optional, as framework ids are unique; aliases work too. On 0.10.1
+/// `add framework nextjs` was a clap error, though the README showed it.
 #[test]
-fn known_i017_framework_needs_language() {
+fn framework_needs_no_language() {
+    for id in ["nextjs", "next"] {
+        let p = Project::new();
+        run(p.path(), &["add", "framework", id, "--yes"])
+            .assert_code(0)
+            .assert_contains("Added 4 variables for Next.js");
+    }
     let p = Project::new();
-    run(p.path(), &["add", "framework", "nextjs", "--yes"])
-        .assert_code(2)
-        .assert_contains("--language <LANGUAGE>");
+    run(
+        p.path(),
+        &[
+            "add",
+            "framework",
+            "--language",
+            "python",
+            "django",
+            "--yes",
+        ],
+    )
+    .assert_code(0)
+    .assert_contains("Added 5 variables for Django");
 }
 
-/// I-017b (AD-C): the wrong language for a known framework lists that
-/// language's frameworks and does not say which language `nextjs` belongs to.
+/// I-017b (fixed in 0.10.2, AD-C; was `known_i017b_*`): the wrong language
+/// for a known framework says which language it belongs to. An unknown id
+/// with a language still lists that language's frameworks; without one it
+/// gets the shared catalogue message with near matches.
 #[test]
-fn known_i017b_wrong_language_gives_no_hint() {
+fn wrong_language_names_the_right_one() {
     let p = Project::new();
     run(
         p.path(),
@@ -758,60 +777,126 @@ fn known_i017b_wrong_language_gives_no_hint() {
         ],
     )
     .assert_code(2)
-    .assert_contains("Unknown framework 'nextjs' for language 'python'")
-    .assert_not_contains("javascript_typescript");
-}
-
-/// I-018 (AD-C): `add service` takes an infra id without saying so, and there
-/// is no `add infra` (DQ-A7 adds it).
-#[test]
-fn known_i018_service_takes_infra_without_a_hint() {
-    let p = Project::new();
-    let out = run(p.path(), &["add", "service", "vercel", "--yes"]);
-    out.assert_code(0);
-    assert!(!out.all().to_lowercase().contains("infra"), "{}", out.all());
-    run(p.path(), &["add", "infra", "vercel", "--yes"])
-        .assert_code(2)
-        .assert_contains("unrecognized subcommand 'infra'");
-}
-
-/// I-019b and N-15 (AD-A, DQ-A6): `framework` and `blueprint` print the preview
-/// under `--yes`, and under `-q` too; `service` does not.
-#[test]
-fn known_i019b_n15_yes_and_quiet_still_preview_framework_and_blueprint() {
-    let p = Project::new();
+    .assert_contains(
+        "nextjs is a javascript_typescript framework: use --language javascript_typescript",
+    );
     run(
         p.path(),
-        &["-q", "add", "framework", "-l", "python", "django", "--yes"],
+        &["add", "framework", "--language", "python", "nope", "--yes"],
     )
-    .assert_code(0)
-    .assert_contains("Preview:");
-    run(p.path(), &["add", "blueprint", "mern_v2", "--yes"])
-        .assert_code(0)
-        .assert_contains("Preview:");
-    run(p.path(), &["add", "service", "redis", "--yes"])
-        .assert_code(0)
-        .assert_not_contains("Preview:");
-}
-
-/// I-020 (AD-A): with no terminal and no `--yes`, `add` prints the preview and
-/// then dialoguer's raw, doubled error, with no hint. Exit 2, nothing written.
-#[test]
-fn known_i020_no_terminal_gives_a_raw_error_after_the_preview() {
-    let p = Project::new();
-    run(p.path(), &["add", "service", "twilio"])
+    .assert_code(2)
+    .assert_contains("Available: django, fastapi_flask");
+    run(p.path(), &["add", "framework", "nxtjs", "--yes"])
         .assert_code(2)
-        .assert_contains("Preview:")
-        .assert_contains("not a terminal: not a terminal")
-        .assert_not_contains("--yes");
+        .assert_contains("Did you mean: nextjs");
     assert!(!p.exists(".env.example"));
 }
 
-/// I-020 / I-025 (AD-F): `add custom --yes` still needs a terminal.
+/// I-018 (fixed in 0.10.2, AD-C, DQ-A7; was `known_i018_*`): one id space.
+/// `add service` and `add framework` take any catalogue id and say what it
+/// is; `add infra` is `add service` under another name. On 0.10.1 an infra id
+/// went through `add service` silently and `add infra` did not exist.
+#[test]
+fn any_id_through_any_subcommand_with_a_hint() {
+    for (args, hint) in [
+        (
+            &["add", "service", "vercel"][..],
+            "vercel is an infra component; adding it.",
+        ),
+        (
+            &["add", "infra", "vercel"],
+            "vercel is an infra component; adding it.",
+        ),
+        (
+            &["add", "service", "nextjs"],
+            "nextjs is a javascript_typescript framework; adding it.",
+        ),
+        (
+            &["add", "framework", "postgresql"],
+            "postgresql is a service component; adding it.",
+        ),
+        (
+            &["add", "framework", "vercel"],
+            "vercel is an infra component; adding it.",
+        ),
+    ] {
+        let p = Project::new();
+        let mut full = args.to_vec();
+        full.push("--yes");
+        let out = run(p.path(), &full);
+        out.assert_code(0).assert_contains(hint);
+        assert_eq!(out.all().matches("adding it.").count(), 1, "{}", out.all());
+    }
+    // A service through `add service` or `add infra` needs no hint.
+    let p = Project::new();
+    run(p.path(), &["add", "infra", "postgresql", "--yes"])
+        .assert_code(0)
+        .assert_not_contains("adding it.");
+}
+
+/// I-019b and N-15 (fixed in 0.10.2, AD-A, DQ-A6; was
+/// `known_i019b_n15_*`): `--yes` never previews, in any subcommand, and `-q`
+/// leaves only problems. On 0.10.1 `framework` and `blueprint` previewed under
+/// `--yes` and under `-q`; `service` did not.
+#[test]
+fn yes_never_previews_and_quiet_shows_only_problems() {
+    let p = Project::new();
+    for args in [
+        &["add", "framework", "-l", "python", "django", "--yes"][..],
+        &["add", "blueprint", "mern_v2", "--yes"],
+        &["add", "service", "redis", "--yes"],
+    ] {
+        run(p.path(), args)
+            .assert_code(0)
+            .assert_not_contains("Preview:");
+    }
+    let q = Project::new().example("DATABASE_URL=postgres://mine\n");
+    let out = run(q.path(), &["-q", "add", "blueprint", "t3_modern", "--yes"]);
+    out.assert_code(0)
+        .assert_contains("1 conflict detected")
+        .assert_contains("DATABASE_URL (existing")
+        .assert_not_contains("Added")
+        .assert_not_contains("Preview:");
+}
+
+/// I-020 (fixed in 0.10.2, AD-A; was `known_i020_*`): with no terminal and no
+/// `--yes`, `add` stops before the preview and says how to run it. On 0.10.1
+/// it printed the preview, then dialoguer's raw, doubled `not a terminal`.
+#[test]
+fn no_terminal_says_to_add_yes() {
+    for (args, example) in [
+        (
+            &["add", "service", "twilio"][..],
+            "evnx add service twilio --yes",
+        ),
+        (
+            &["add", "framework", "-l", "python", "django"],
+            "evnx add framework --language python django --yes",
+        ),
+        (
+            &["add", "blueprint", "mern_v2"],
+            "evnx add blueprint mern_v2 --yes",
+        ),
+    ] {
+        let p = Project::new();
+        run(p.path(), args)
+            .assert_code(2)
+            .assert_contains("there is no terminal to confirm with")
+            .assert_contains(example)
+            .assert_not_contains("Preview:")
+            .assert_not_contains("not a terminal: not a terminal");
+        assert!(!p.exists(".env.example"));
+    }
+}
+
+/// I-020 / I-025 (AD-F): `add custom --yes` still needs a terminal. Since
+/// AD-A it says so instead of printing dialoguer's raw error.
 #[test]
 fn known_i020c_custom_yes_needs_a_terminal() {
     let p = Project::new();
-    run(p.path(), &["add", "custom", "--yes"]).assert_code(2);
+    run(p.path(), &["add", "custom", "--yes"])
+        .assert_code(2)
+        .assert_contains("`evnx add custom` asks for each variable, so it needs a terminal");
     assert!(!p.exists(".env.example"));
 }
 
@@ -825,24 +910,32 @@ fn known_i021_no_env_is_created() {
     assert!(!p.exists(".env"));
 }
 
-/// I-022 plurals (AD-A): `1 conflicts`, `1 conflicting variables`.
+/// I-022 (fixed in 0.10.2, AD-A; was `known_i022c_*`): one conflict is
+/// singular. 0.10.1 said `1 conflicts detected`, `Skipped 1 conflicting
+/// variables`.
 #[test]
-fn known_i022c_one_conflict_is_plural() {
+fn one_conflict_is_singular() {
     let p = Project::new().example("DATABASE_URL=postgres://mine\n");
     run(p.path(), &["add", "blueprint", "t3_modern", "--yes"])
         .assert_code(0)
-        .assert_contains("1 conflicts detected")
-        .assert_contains("Skipped 1 conflicting variables");
+        .assert_contains("1 conflict detected")
+        .assert_contains("Skipped 1 conflicting variable (preserved existing values)")
+        .assert_not_contains("1 conflicts")
+        .assert_not_contains("1 conflicting variables");
 }
 
-/// I-024 (AD-A; DA-15): `-v` says `.env` got "TODO placeholders", which `add`
-/// stopped writing in v0.5.0.
+/// I-024 (fixed in 0.10.2, AD-A; was `known_i024_*`; DA-15): `-v` says what
+/// it did to `.env`. It said "with TODO placeholders" two releases after
+/// `add` stopped writing them.
 #[test]
-fn known_i024_verbose_mentions_todo_placeholders() {
+fn verbose_says_appended() {
     let p = Project::new().example("A=\n").env("A=1\n");
-    run(p.path(), &["-v", "add", "service", "redis", "--yes"])
-        .assert_code(0)
-        .assert_contains("with TODO placeholders");
+    let out = run(p.path(), &["-v", "add", "service", "redis", "--yes"]);
+    out.assert_code(0).assert_not_contains("TODO");
+    // The path is printed with the platform's separator (`.\.env` on
+    // Windows); the test pins the words, not the separator.
+    let stdout = out.stdout.replace('\\', "/");
+    assert!(stdout.contains("[DEBUG] Appended to ./.env\n"), "{stdout}");
 }
 
 /// I-025 (AD-F): `add custom` takes no `NAME=value` arguments.
@@ -870,30 +963,9 @@ fn known_i026_no_list_dry_run_or_json() {
     assert!(!p.exists(".env.example"));
 }
 
-/// N-10 (AD-A): the preview's `• framework / service / infra` lines come out
-/// of a `HashMap`, so their order changes between runs.
-///
-/// ⚠️ Probabilistic: with three groups, ten runs all in the same order has a
-/// chance of about 1 in 10 million.
-#[test]
-fn known_n10_preview_order_changes_between_runs() {
-    let mut orders = std::collections::BTreeSet::new();
-    for _ in 0..10 {
-        let p = Project::new();
-        let out = run(p.path(), &["add", "blueprint", "t3_modern", "--yes"]);
-        let order: Vec<String> = out
-            .stdout
-            .lines()
-            .filter(|l| l.trim_start().starts_with("• "))
-            .map(str::to_string)
-            .collect();
-        orders.insert(order);
-    }
-    assert!(orders.len() > 1, "one order in 10 runs: {orders:?}");
-}
-
-/// N-14 (AD-S) and N-14b (AD-A): with a read-only `.env`, the run fails after
-/// `.env.example` was already appended, and the error does not name the file.
+/// N-14 (AD-S): with a read-only `.env`, the run fails after `.env.example`
+/// was already appended. (N-14b, the error not naming the file, was fixed in
+/// AD-A and is asserted here too.)
 #[cfg(unix)]
 #[test]
 fn known_n14_read_only_env_leaves_a_partial_write() {
@@ -910,25 +982,31 @@ fn known_n14_read_only_env_leaves_a_partial_write() {
         return; // running as root: permissions do not apply
     }
     let out = run(p.path(), &["add", "service", "redis", "--yes"]);
-    out.assert_code(2).assert_contains("Permission denied");
-    assert!(!out.all().contains(".env"), "{}", out.all());
+    // N-14b (fixed in 0.10.2, AD-A): the error names the file.
+    out.assert_code(2)
+        .assert_contains("Failed to write ./.env: Permission denied");
     assert_eq!(p.count_lines(".env.example", "REDIS_URL="), 1);
     assert_eq!(p.count_lines(".env", "REDIS_URL="), 0);
 }
 
-/// N-16 (AD-B): a CRLF `.env.example` gets LF lines appended.
+/// N-16 (fixed in 0.10.2, AD-B; was `known_n16_*`): what `add` appends
+/// follows each file's own line endings, and the user's lines are untouched.
+/// On 0.10.1 a CRLF file came back with LF lines appended.
 #[test]
-fn known_n16_crlf_file_gets_lf_lines() {
-    let p = Project::new().example("A=1\r\nB=2\r\n");
+fn appended_lines_follow_each_files_line_endings() {
+    let p = Project::new().example("A=1\r\nB=2\r\n").env("A=x\nB=y\n");
     run(p.path(), &["add", "service", "redis", "--yes"]).assert_code(0);
-    let raw = std::fs::read(p.join(".env.example")).unwrap();
-    let text = String::from_utf8(raw).unwrap();
-    let line = text
-        .split('\n')
-        .find(|l| l.starts_with("REDIS_URL="))
-        .unwrap();
-    assert!(!line.ends_with('\r'), "already CRLF: {line:?}");
-    assert!(text.starts_with("A=1\r\n"), "original line endings changed");
+
+    let example = String::from_utf8(std::fs::read(p.join(".env.example")).unwrap()).unwrap();
+    assert!(example.starts_with("A=1\r\nB=2\r\n"), "{example:?}");
+    assert!(
+        !example.replace("\r\n", "").contains('\n'),
+        "LF in a CRLF file: {example:?}"
+    );
+    assert!(example.contains("\r\nREDIS_URL="), "{example:?}");
+
+    let env = String::from_utf8(std::fs::read(p.join(".env")).unwrap()).unwrap();
+    assert!(!env.contains('\r'), "CRLF in an LF file: {env:?}");
 }
 
 /// BR-1 (AD-H, DQ-A8): `add service supabase` on a Vite project adds no
