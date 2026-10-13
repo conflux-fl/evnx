@@ -6,13 +6,30 @@ use anyhow::{Context, Result};
 use colored::*;
 use std::path::Path;
 
-use super::shared::{aborted, append_to_env_files, count, detect_conflicts, AppendMode, Outcome};
+use super::shared::{confirm_and_apply, count, Flow, Mode, Outcome};
 use crate::schema::{formatter, loader, resolver};
-use crate::utils::prompt::{require_terminal, yes_no};
-use crate::utils::ui::{info, success, warning};
 
 /// Handle blueprint addition
-pub fn handle(blueprint_id: &str, output_path: &Path, yes: bool, verbose: bool) -> Result<Outcome> {
+pub fn handle(blueprint_id: Option<&str>, output_path: &Path, mode: &Mode) -> Result<Outcome> {
+    // No id: pick one.
+    let picked;
+    let blueprint_id = match blueprint_id {
+        Some(id) => id,
+        None => {
+            let items: Vec<(String, String)> = loader::list_blueprints()
+                .into_iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect();
+            match super::pick(mode, "blueprint", &items)? {
+                Some(id) => {
+                    picked = id;
+                    picked.as_str()
+                }
+                None => return Ok(super::shared::aborted()),
+            }
+        }
+    };
+
     // 1. Find blueprint
     //
     // ⚠️ The list is printed here rather than pointing at another command.
@@ -37,7 +54,7 @@ pub fn handle(blueprint_id: &str, output_path: &Path, yes: bool, verbose: bool) 
         }
     };
 
-    if verbose {
+    if mode.verbose {
         println!(
             "{} Resolving blueprint: {} ({})",
             "[DEBUG]".dimmed(),
@@ -50,95 +67,27 @@ pub fn handle(blueprint_id: &str, output_path: &Path, yes: bool, verbose: bool) 
     let vars =
         resolver::resolve_blueprint(blueprint).context("Failed to resolve blueprint variables")?;
 
-    // 3. Check for conflicts with existing .env.example
-    let example_path = output_path.join(".env.example");
-    let conflicts = if example_path.exists() {
-        let existing_content = std::fs::read_to_string(&example_path)?;
-        detect_conflicts(&existing_content, &vars)
-    } else {
-        Vec::new()
+    // 3. Skip what is there, list what differs, ask, write: the same path as
+    // every other subcommand (AD-S). This command used to be the only one that
+    // skipped anything, and only names whose value differed.
+    let name = blueprint.name.clone();
+    let heading = || println!("\n{}", "Preview:".bold());
+    let render = |v: &crate::schema::models::VarCollection| {
+        Ok(format!(
+            "\n# ── Blueprint: {name} ──\n{}",
+            formatter::format_addition(v)?
+        ))
     };
-
-    // 4. Preview, unless --yes (DQ-A6: `--yes` never previews; I-019, N-15).
-    if !yes {
-        require_terminal(&format!("evnx add blueprint {blueprint_id} --yes"))?;
-        println!("\n{}", "Preview:".bold());
-        println!("{}", formatter::generate_preview(&vars).dimmed());
-    }
-
-    // Conflicts are a finding, not chatter: they print under `--yes` and `-q`.
-    if !conflicts.is_empty() {
-        warning(format!("{} detected", count(conflicts.len(), "conflict")));
-        for conflict in &conflicts {
-            println!(
-                "  • {} (existing: \"{}\", new: \"{}\")",
-                conflict.var_name.bold(),
-                conflict.existing_value.dimmed(),
-                conflict.new_value.dimmed()
-            );
-        }
-        info("Conflicting variables will be SKIPPED (not overwritten)");
-    }
-
-    // 5. Confirm (unless --yes)
-    if !yes {
-        let prompt = if conflicts.is_empty() {
-            format!(
-                "Add these {} to .env.example?",
-                count(vars.vars.len(), "variable")
-            )
-        } else {
-            format!(
-                "Add {} (skipping {})?",
-                count(vars.vars.len() - conflicts.len(), "new variable"),
-                count(conflicts.len(), "conflict")
-            )
-        };
-
-        let confirm = yes_no().with_prompt(&prompt).default(true).interact_opt()?;
-        if confirm != Some(true) {
-            return Ok(aborted());
-        }
-    }
-
-    // 6. Format addition (excluding conflicts)
-    let filtered_vars = if conflicts.is_empty() {
-        vars.clone()
-    } else {
-        let mut filtered = vars.clone();
-        for conflict in &conflicts {
-            filtered.vars.remove(&conflict.var_name);
-        }
-        filtered
+    let flow = Flow {
+        noun: "variable",
+        what: format!("from blueprint '{name}'"),
+        terminal_example: Some(format!("evnx add blueprint {blueprint_id} --yes")),
+        heading: &heading,
+        preview: &formatter::generate_preview,
+        question: &|n, file| format!("Add these {} to {file}?", count(n, "variable")),
+        render: &render,
     };
-
-    let addition = formatter::format_addition(&filtered_vars)?;
-    let header = format!("\n# ── Blueprint: {} ──\n", blueprint.name);
-    let content = format!("{}{}", header, addition);
-
-    // 7. Append to files (skip conflicts mode)
-    append_to_env_files(
-        output_path,
-        &content,
-        AppendMode::SkipConflicts,
-        verbose,
-        &filtered_vars,
-    )?;
-
-    success(format!(
-        "Added {} from blueprint '{}'",
-        count(filtered_vars.vars.len(), "variable"),
-        blueprint.name
-    ));
-
-    if !conflicts.is_empty() {
-        info(format!(
-            "Skipped {} (preserved existing values)",
-            count(conflicts.len(), "conflicting variable")
-        ));
-    }
-
-    Ok(Outcome::Written)
+    confirm_and_apply(output_path, &vars, &flow, mode)
 }
 
 #[cfg(test)]
@@ -156,7 +105,15 @@ mod tests {
         fs::write(&example_path, "DATABASE_URL=existing_value\n").unwrap();
 
         // Handle blueprint that includes postgresql (which defines DATABASE_URL)
-        handle("t3_modern", dir.path(), true, false).unwrap();
+        handle(
+            Some("t3_modern"),
+            dir.path(),
+            &crate::commands::add::shared::Mode {
+                yes: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // Verify conflict was skipped
         let content = fs::read_to_string(&example_path).unwrap();

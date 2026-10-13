@@ -104,20 +104,19 @@ fn add_service_unknown_returns_error() {
         .stderr(predicate::str::contains("unknown component"));
 }
 
-/// I-016 (KNOWN in 0.10.1; flipped by AD-S): adding a service twice writes
-/// every name twice, in both files, and the second run still says it added
-/// them. T-003: this was `add_service_multiple_times_deduplicates`, commented
-/// out with the right expectation (`DATABASE_URL` once); it comes back as that
-/// test when AD-S lands.
+/// I-016 (fixed in 0.10.2, AD-S; was `known_i016_*`). T-003: this is the
+/// test that sat commented out as `add_service_multiple_times_deduplicates`,
+/// with the right expectation, while the product duplicated every name.
 #[test]
-fn known_i016_re_adding_a_service_duplicates_every_name() {
+fn add_service_multiple_times_deduplicates() {
     let p = Project::new().example("APP_NAME=test\n").env("APP_NAME=\n");
     run(p.path(), &["add", "service", "postgresql", "--yes"]).assert_code(0);
     run(p.path(), &["add", "service", "postgresql", "--yes"])
         .assert_code(0)
-        .assert_contains("Added 6 variables for PostgreSQL");
-    assert_eq!(p.count_lines(".env.example", "DATABASE_URL="), 2);
-    assert_eq!(p.count_lines(".env", "DATABASE_URL="), 2);
+        .assert_contains("Nothing to add: 6 variables for PostgreSQL already in .env.example")
+        .assert_not_contains("Added");
+    assert_eq!(p.count_lines(".env.example", "DATABASE_URL="), 1);
+    assert_eq!(p.count_lines(".env", "DATABASE_URL="), 1);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -658,36 +657,37 @@ fn other_env_files_are_left_alone() {
 // KNOWN IN 0.10.1 — each test pins a defect; the named package flips it
 // ─────────────────────────────────────────────────────────────
 
-/// I-016 (AD-S): `add blueprint` re-adds a name whose value is identical; it
-/// skips only names whose value differs.
+/// I-016 (fixed in 0.10.2, AD-S; was `known_i016d_*`): `add blueprint` skips
+/// a name already present with the same value, and says how many it skipped.
 #[test]
-fn known_i016d_blueprint_re_adds_identical_names() {
+fn blueprint_skips_names_already_present() {
     let p = Project::new();
     run(p.path(), &["add", "service", "postgresql", "--yes"]).assert_code(0);
-    run(p.path(), &["add", "blueprint", "t3_modern", "--yes"]).assert_code(0);
-    assert_eq!(p.count_lines(".env.example", "DATABASE_URL="), 2);
+    run(p.path(), &["add", "blueprint", "t3_modern", "--yes"])
+        .assert_code(0)
+        // t3_modern's six PostgreSQL names are already there, same values.
+        .assert_contains("skipped 6 already present");
+    assert_eq!(p.count_lines(".env.example", "DATABASE_URL="), 1);
 }
 
-/// I-016 (AD-S; DA-14 in the docs): `add service` appends a name whose
-/// existing value differs, with no conflict shown.
+/// I-016, DQ-A3 (fixed in 0.10.2, AD-S; was `known_i016e_*`): a name whose
+/// value in `.env.example` differs is kept, not appended, and listed. All four
+/// subcommands do this now; only `blueprint` did on 0.10.1.
 #[test]
-fn known_i016e_a_differing_value_is_appended_without_warning() {
+fn a_differing_value_is_kept_and_listed() {
     let dir = TempDir::new().unwrap();
     setup_postgres_project(dir.path()).unwrap();
-    let out = run(dir.path(), &["add", "service", "postgresql", "--yes"]);
-    out.assert_code(0);
-    assert!(
-        !out.all().to_lowercase().contains("conflict"),
-        "{}",
-        out.all()
-    );
+    run(dir.path(), &["add", "service", "postgresql", "--yes"])
+        .assert_code(0)
+        .assert_contains("with a different value in .env.example: kept as it is")
+        .assert_contains("DATABASE_URL (existing: \"postgresql://user:pass@localhost/prod_db\"");
     let example = read_env_example(dir.path()).unwrap();
     assert_eq!(
         example
             .lines()
             .filter(|l| l.starts_with("DATABASE_URL="))
             .count(),
-        2
+        1
     );
 }
 
@@ -701,34 +701,52 @@ fn effective(text: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// N-11 (high; AD-S): a re-add appends the placeholder below the user's real
-/// value in `.env`, and the placeholder is the one that takes effect.
+/// N-11 (fixed in 0.10.2, AD-S; was `known_n11_*`): a name `.env` already
+/// has is not appended there again, so the user's real value stays the one in
+/// effect. On 0.10.1 the placeholder landed below it and won.
 #[test]
-fn known_n11_a_re_add_shadows_the_real_env_value() {
+fn a_re_add_keeps_the_real_env_value() {
     let p = Project::new()
         .example("REDIS_URL=redis://localhost:6379/0\n")
         .env(&format!("{REAL_REDIS}\n"));
     run(p.path(), &["add", "service", "redis", "--yes"]).assert_code(0);
+    assert_eq!(p.count_lines(".env", "REDIS_URL="), 1);
     assert_eq!(
-        effective(&p.read(".env"), "REDIS_URL").as_deref(),
-        Some("REDIS_URL=redis://localhost:6379/0")
-    );
-}
-
-/// N-11b (AD-S): `add blueprint` looks for conflicts in `.env.example` only, so
-/// a real value in `.env` is shadowed and no conflict is shown.
-#[test]
-fn known_n11b_blueprint_misses_a_conflict_in_env() {
-    let p = Project::new()
-        .example("REDIS_URL=redis://localhost:6379/0\n")
-        .env(&format!("{REAL_REDIS}\n"));
-    let out = run(p.path(), &["add", "blueprint", "fastapi_ai", "--yes"]);
-    out.assert_code(0)
-        .assert_not_contains("REDIS_URL (existing");
-    assert_ne!(
         effective(&p.read(".env"), "REDIS_URL").as_deref(),
         Some(REAL_REDIS)
     );
+}
+
+/// N-11b (fixed in 0.10.2, AD-S; was `known_n11b_*`): `add blueprint` keeps
+/// a real `.env` value too. `.env`'s value is never printed: it is a secret,
+/// and differs from the placeholder by design.
+#[test]
+fn blueprint_keeps_the_real_env_value() {
+    let p = Project::new()
+        .example("REDIS_URL=redis://localhost:6379/0\n")
+        .env(&format!("{REAL_REDIS}\n"));
+    run(p.path(), &["add", "blueprint", "fastapi_ai", "--yes"])
+        .assert_code(0)
+        .assert_not_contains("real-host");
+    assert_eq!(
+        effective(&p.read(".env"), "REDIS_URL").as_deref(),
+        Some(REAL_REDIS)
+    );
+}
+
+/// DQ-A2: per file. A name `.env.example` already has but `.env` lacks is
+/// added to `.env` only, and the run says so.
+#[test]
+fn env_catches_up_with_the_template() {
+    let p = Project::new()
+        .example("REDIS_URL=redis://localhost:6379/0\n")
+        .env("OTHER=1\n");
+    run(p.path(), &["add", "service", "redis", "--yes"])
+        .assert_code(0)
+        .assert_contains("Added 4 variables for Redis, skipped 1 already present")
+        .assert_contains("Added 1 variable to .env that .env.example already had: REDIS_URL");
+    assert_eq!(p.count_lines(".env.example", "REDIS_URL="), 1);
+    assert_eq!(p.count_lines(".env", "REDIS_URL="), 1);
 }
 
 /// I-017 (fixed in 0.10.2, AD-C; was `known_i017_*`): `--language` is
@@ -853,7 +871,7 @@ fn yes_never_previews_and_quiet_shows_only_problems() {
     let q = Project::new().example("DATABASE_URL=postgres://mine\n");
     let out = run(q.path(), &["-q", "add", "blueprint", "t3_modern", "--yes"]);
     out.assert_code(0)
-        .assert_contains("1 conflict detected")
+        .assert_contains("1 variable with a different value in .env.example")
         .assert_contains("DATABASE_URL (existing")
         .assert_not_contains("Added")
         .assert_not_contains("Preview:");
@@ -889,25 +907,36 @@ fn no_terminal_says_to_add_yes() {
     }
 }
 
-/// I-020 / I-025 (AD-F): `add custom --yes` still needs a terminal. Since
-/// AD-A it says so instead of printing dialoguer's raw error.
+/// I-020 (fixed in 0.10.2, AD-F; was `known_i020c_*`): with no terminal,
+/// `add custom` with no arguments points at the argument form, which needs
+/// none. On 0.10.1 `add custom --yes` could not run without a terminal at all.
 #[test]
-fn known_i020c_custom_yes_needs_a_terminal() {
+fn custom_without_a_terminal_points_at_arguments() {
     let p = Project::new();
     run(p.path(), &["add", "custom", "--yes"])
         .assert_code(2)
-        .assert_contains("`evnx add custom` asks for each variable, so it needs a terminal");
+        .assert_contains("evnx add custom NAME=value OTHER_NAME=value --yes");
     assert!(!p.exists(".env.example"));
+    run(p.path(), &["add", "custom", "A=1", "--yes"]).assert_code(0);
+    assert_eq!(p.count_lines(".env.example", "A=1"), 1);
 }
 
-/// I-021 (AD-S, DQ-A4): with no `.env`, `add` writes only `.env.example`.
-/// After AD-S it creates `.env` from the template, as `init` does.
+/// I-021, DQ-A4 (fixed in 0.10.2, AD-S; was `known_i021_*`): with no `.env`,
+/// `add` creates it from the template, as `init` does: `.gitignore` first,
+/// then a byte copy. Under `--yes` without asking. On 0.10.1 it wrote only
+/// `.env.example` and said nothing.
 #[test]
-fn known_i021_no_env_is_created() {
+fn no_env_is_created_from_the_template() {
     let p = Project::new();
-    run(p.path(), &["add", "service", "redis", "--yes"]).assert_code(0);
-    assert!(p.exists(".env.example"));
-    assert!(!p.exists(".env"));
+    run(p.path(), &["add", "service", "redis", "--yes"])
+        .assert_code(0)
+        .assert_contains("Created .env from .env.example");
+    assert_eq!(p.read(".env"), p.read(".env.example"));
+    assert!(
+        p.read(".gitignore").contains(".env*"),
+        "{}",
+        p.read(".gitignore")
+    );
 }
 
 /// I-022 (fixed in 0.10.2, AD-A; was `known_i022c_*`): one conflict is
@@ -918,10 +947,9 @@ fn one_conflict_is_singular() {
     let p = Project::new().example("DATABASE_URL=postgres://mine\n");
     run(p.path(), &["add", "blueprint", "t3_modern", "--yes"])
         .assert_code(0)
-        .assert_contains("1 conflict detected")
-        .assert_contains("Skipped 1 conflicting variable (preserved existing values)")
-        .assert_not_contains("1 conflicts")
-        .assert_not_contains("1 conflicting variables");
+        .assert_contains("1 variable with a different value in .env.example")
+        .assert_contains("skipped 1 already present")
+        .assert_not_contains("1 variables");
 }
 
 /// I-024 (fixed in 0.10.2, AD-A; was `known_i024_*`; DA-15): `-v` says what
@@ -938,37 +966,280 @@ fn verbose_says_appended() {
     assert!(stdout.contains("[DEBUG] Appended to ./.env\n"), "{stdout}");
 }
 
-/// I-025 (AD-F): `add custom` takes no `NAME=value` arguments.
+/// I-025, T-ADD-40 (fixed in 0.10.2, AD-F; was `known_i025_*`): `add custom`
+/// takes `NAME=value` arguments, several at once, with no terminal.
 #[test]
-fn known_i025_custom_takes_no_arguments() {
-    let p = Project::new();
-    run(p.path(), &["add", "custom", "API_KEY=abc", "--yes"])
-        .assert_code(2)
-        .assert_contains("unexpected argument 'API_KEY=abc'");
+fn custom_takes_name_value_arguments() {
+    let p = Project::new().example("APP=1\n").env("APP=1\n");
+    run(
+        p.path(),
+        &[
+            "add",
+            "custom",
+            "API_URL=https://api.example.com",
+            "DEBUG=false",
+            "--yes",
+        ],
+    )
+    .assert_code(0)
+    .assert_contains("Added 2 custom variables");
+    for f in [".env.example", ".env"] {
+        let text = p.read(f);
+        assert!(
+            text.contains("\nAPI_URL=https://api.example.com\n"),
+            "{f}:\n{text}"
+        );
+        assert!(text.contains("\nDEBUG=false\n"), "{f}:\n{text}");
+        assert!(text.contains("# ── Custom Variables ──"), "{f}:\n{text}");
+    }
 }
 
-/// I-026 (AD-G): no `--list`, `--dry-run` or `--json`.
+/// T-ADD-41: a name without a value gets the placeholder (no terminal, or
+/// `--yes`, so nothing is asked even for a secret-looking name).
 #[test]
-fn known_i026_no_list_dry_run_or_json() {
+fn custom_name_alone_gets_the_placeholder() {
+    let p = Project::new();
+    run(
+        p.path(),
+        &[
+            "add",
+            "custom",
+            "FEATURE_FLAG",
+            "STRIPE_SECRET_KEY",
+            "--yes",
+        ],
+    )
+    .assert_code(0);
+    let example = p.read(".env.example");
+    assert!(
+        example.contains("FEATURE_FLAG=your_value_here"),
+        "{example}"
+    );
+    assert!(
+        example.contains("STRIPE_SECRET_KEY=your_value_here"),
+        "{example}"
+    );
+}
+
+/// T-ADD-42: an invalid or repeated name fails before anything is written,
+/// even when the names before it are fine.
+#[test]
+fn custom_checks_every_name_before_writing() {
     let p = Project::new();
     for args in [
-        &["add", "--list"][..],
-        &["add", "service", "redis", "--dry-run", "--yes"],
-        &["add", "service", "redis", "--json", "--yes"],
+        &["add", "custom", "GOOD=1", "my var=2", "--yes"][..],
+        &["add", "custom", "GOOD=1", "9LIVES=2", "--yes"],
+        &["add", "custom", "GOOD=1", "GOOD=2", "--yes"],
+        &["add", "custom", "GOOD=1", "--category", "nope", "--yes"],
     ] {
-        run(p.path(), args)
-            .assert_code(2)
-            .assert_contains("unexpected argument");
+        run(p.path(), args).assert_code(2);
+        assert!(!p.exists(".env.example"), "{args:?}");
     }
+}
+
+/// T-ADD-43: `--desc`, `--category` (any case) and `--required` apply to
+/// every name given, in one comment line above each.
+#[test]
+fn custom_flags_go_into_the_written_block() {
+    let p = Project::new();
+    run(
+        p.path(),
+        &[
+            "add",
+            "custom",
+            "WEBHOOK_SECRET",
+            "--desc",
+            "Webhook signing secret",
+            "--category",
+            "security",
+            "--required",
+            "--yes",
+        ],
+    )
+    .assert_code(0);
+    let example = p.read(".env.example");
+    assert!(
+        example.contains(
+            "# [Security] Webhook signing secret (required)\nWEBHOOK_SECRET=your_value_here\n"
+        ),
+        "{example}"
+    );
+}
+
+/// T-ADD-45: a name the template already has is skipped and reported (AD-S).
+#[test]
+fn custom_argument_already_present_is_skipped() {
+    let p = Project::new().example("DEBUG=false\n");
+    run(
+        p.path(),
+        &["add", "custom", "DEBUG=false", "NEW=1", "--yes"],
+    )
+    .assert_code(0)
+    .assert_contains("Added 1 custom variable, skipped 1 already present");
+    assert_eq!(p.count_lines(".env.example", "DEBUG="), 1);
+    assert_eq!(p.count_lines(".env.example", "NEW="), 1);
+}
+
+/// The ids in a `--list`-style listing: the first word of every indented
+/// line that looks like an id.
+fn listed_ids(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| l.starts_with("    "))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| {
+            w.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// I-026, 7a, 7f, T-ADD-50 (fixed in 0.10.2, AD-G; was `known_i026_*`):
+/// `add --list` lists every component `init --list-components` lists, from
+/// the same function, then the blueprints.
+#[test]
+fn add_list_matches_init_and_adds_blueprints() {
+    let p = Project::new();
+    let add = run(p.path(), &["add", "--list"]);
+    add.assert_code(0).assert_contains("BLUEPRINT");
+    let init = run(p.path(), &["init", "--list-components"]);
+    init.assert_code(0);
+    let (components, blueprints) = add.stdout.split_once("BLUEPRINT").unwrap();
+    assert_eq!(listed_ids(components), listed_ids(&init.stdout));
+    assert!(listed_ids(&init.stdout).len() > 40);
+    assert_eq!(listed_ids(blueprints).len(), 10, "{blueprints}");
     assert!(!p.exists(".env.example"));
 }
 
-/// N-14 (AD-S): with a read-only `.env`, the run fails after `.env.example`
-/// was already appended. (N-14b, the error not naming the file, was fixed in
-/// AD-A and is asserted here too.)
+/// I-026, T-ADD-51: `--dry-run` writes nothing, needs no terminal, and exits 0,
+/// for every subcommand; it says what would happen.
+#[test]
+fn dry_run_writes_nothing_in_every_subcommand() {
+    for args in [
+        &["add", "service", "postgresql", "--dry-run"][..],
+        &["add", "framework", "nextjs", "--dry-run"],
+        &["add", "blueprint", "t3_modern", "--dry-run"],
+        &["add", "custom", "A=1", "B", "--dry-run"],
+    ] {
+        let p = Project::new()
+            .example("DATABASE_URL=postgres://mine\n")
+            .env("X=1\n");
+        let before = (p.read(".env.example"), p.read(".env"));
+        run(p.path(), args)
+            .assert_code(0)
+            .assert_contains("Dry run")
+            .assert_contains("nothing was written")
+            .assert_contains(".env.example: would add");
+        assert_eq!((p.read(".env.example"), p.read(".env")), before, "{args:?}");
+        assert!(!p.exists(".gitignore"), "{args:?}");
+    }
+}
+
+/// I-026: with no `.env`, a dry run says one would be created, and creates none.
+#[test]
+fn dry_run_says_env_would_be_created() {
+    let p = Project::new();
+    run(p.path(), &["add", "service", "redis", "--dry-run"])
+        .assert_code(0)
+        .assert_contains(".env: would be created from .env.example");
+    assert!(!p.exists(".env") && !p.exists(".env.example"));
+}
+
+/// I-026, 7c, T-ADD-52: `--json` prints one document, alone on stdout, with
+/// the stable fields; with `--dry-run` it writes nothing.
+#[test]
+fn json_reports_added_skipped_and_conflicts() {
+    let setup = || {
+        Project::new()
+            .example("DATABASE_URL=postgres://mine\nDB_PORT=5432\n")
+            .env("DB_PORT=1\n")
+            .file(".gitignore", ".env\n")
+    };
+    for (extra, written) in [("--dry-run", false), ("--yes", true)] {
+        let p = setup();
+        let out = run(p.path(), &["add", "service", "postgresql", "--json", extra]);
+        out.assert_code(0);
+        let doc: serde_json::Value = serde_json::from_str(&out.stdout)
+            .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}):\n{}", out.stdout));
+        assert_eq!(doc["dry_run"], !written);
+        assert_eq!(doc["written"], written);
+        assert_eq!(
+            doc["added"],
+            serde_json::json!(["DB_HOST", "DB_NAME", "DB_PASSWORD", "DB_USER"])
+        );
+        assert_eq!(doc["skipped"], serde_json::json!(["DB_PORT"]));
+        assert_eq!(doc["conflicts"][0]["name"], "DATABASE_URL");
+        assert_eq!(doc["conflicts"][0]["existing"], "postgres://mine");
+        assert_eq!(doc["env_added"].as_array().unwrap().len(), 4);
+        assert_eq!(doc["env_created"], false);
+        // Nothing from .env ever appears: its DB_PORT value is "1".
+        assert!(!out.stdout.contains("\"1\""), "{}", out.stdout);
+        assert_eq!(
+            p.count_lines(".env.example", "DB_HOST="),
+            usize::from(written)
+        );
+    }
+}
+
+/// I-026: `--json` never asks, so it needs `--yes` or `--dry-run`.
+#[test]
+fn json_needs_yes_or_dry_run() {
+    let p = Project::new();
+    run(p.path(), &["add", "service", "redis", "--json"])
+        .assert_code(2)
+        .assert_contains("--json needs --yes or --dry-run");
+    assert!(!p.exists(".env.example"));
+}
+
+/// T-SHARE-33 on `add`: the pretty and JSON runs agree on the exit code and on
+/// every byte written.
+#[test]
+fn pretty_and_json_write_the_same_files() {
+    support::renderers::both_renderers(
+        || {
+            Project::new()
+                .example("DATABASE_URL=postgres://mine\n")
+                .env("X=1\n")
+                .file(".gitignore", ".env\n")
+        },
+        &["add", "service", "postgresql", "--yes"],
+        &["add", "service", "postgresql", "--yes", "--json"],
+    );
+}
+
+/// I-026, 7e, T-ADD-53: every subcommand runs without a terminal under
+/// `--yes`; with no id and no terminal, the error points at `--list`.
+#[test]
+fn every_subcommand_runs_without_a_terminal() {
+    for args in [
+        &["add", "service", "redis", "--yes"][..],
+        &["add", "infra", "vercel", "--yes"],
+        &["add", "framework", "django", "--yes"],
+        &["add", "blueprint", "mern_v2", "--yes"],
+        &["add", "custom", "A=1", "--yes"],
+    ] {
+        let p = Project::new();
+        run(p.path(), args).assert_code(0);
+        assert!(p.exists(".env.example"), "{args:?}");
+    }
+    for args in [
+        &["add", "service", "--yes"][..],
+        &["add", "framework"],
+        &["add", "blueprint", "--dry-run"],
+    ] {
+        let p = Project::new();
+        run(p.path(), args)
+            .assert_code(2)
+            .assert_contains("evnx add --list");
+    }
+}
+
+/// N-14 (fixed in 0.10.2, AD-S; was `known_n14_*`): a read-only `.env` stops
+/// the run before anything is written. On 0.10.1 `.env.example` had already
+/// been appended. N-14b (AD-A): the error names the file.
 #[cfg(unix)]
 #[test]
-fn known_n14_read_only_env_leaves_a_partial_write() {
+fn a_read_only_env_stops_the_run_before_any_write() {
     let p = Project::new()
         .example("A=\n")
         .env("A=1\n")
@@ -985,7 +1256,7 @@ fn known_n14_read_only_env_leaves_a_partial_write() {
     // N-14b (fixed in 0.10.2, AD-A): the error names the file.
     out.assert_code(2)
         .assert_contains("Failed to write ./.env: Permission denied");
-    assert_eq!(p.count_lines(".env.example", "REDIS_URL="), 1);
+    assert_eq!(p.count_lines(".env.example", "REDIS_URL="), 0);
     assert_eq!(p.count_lines(".env", "REDIS_URL="), 0);
 }
 
@@ -1009,15 +1280,115 @@ fn appended_lines_follow_each_files_line_endings() {
     assert!(!env.contains('\r'), "CRLF in an LF file: {env:?}");
 }
 
-/// BR-1 (AD-H, DQ-A8): `add service supabase` on a Vite project adds no
-/// `VITE_` copies of the public variables. `init --with vite,supabase` does.
+/// BR-1 (fixed in 0.10.2, AD-H, DQ-A8; was `known_br1_*`): `add service`
+/// reads the project's framework the way `init --detect` does and adds the
+/// browser copies of the public values, as `init --with vite,supabase` does.
 #[test]
-fn known_br1_service_adds_no_browser_copies() {
-    let p = Project::new()
+fn service_adds_browser_copies_for_the_detected_framework() {
+    for (package, prefix) in [
+        (r#"{"devDependencies":{"vite":"5"}}"#, "VITE_"),
+        (r#"{"dependencies":{"next":"16"}}"#, "NEXT_PUBLIC_"),
+    ] {
+        let p = Project::new()
+            .file("package.json", package)
+            .example("APP=1\n");
+        run(p.path(), &["add", "service", "supabase", "--yes"])
+            .assert_code(0)
+            .assert_contains(&format!("adding 2 {prefix} copies for the browser"));
+        let example = p.read(".env.example");
+        for name in ["SUPABASE_URL", "SUPABASE_ANON_KEY"] {
+            assert!(example.contains(&format!("\n{prefix}{name}=")), "{example}");
+        }
+        // Secrets never get a browser copy.
+        assert!(!example.contains(&format!("{prefix}SUPABASE_SERVICE_ROLE_KEY")));
+    }
+}
+
+/// BR-1: the copies are the ones `init --with` writes, line for line.
+#[test]
+fn service_copies_match_init() {
+    let via_add = Project::new()
         .file("package.json", r#"{"devDependencies":{"vite":"5"}}"#)
-        .example("VITE_APP_TITLE=x\n");
-    run(p.path(), &["add", "service", "supabase", "--yes"]).assert_code(0);
-    let example = p.read(".env.example");
-    assert!(example.contains("\nSUPABASE_URL="), "{example}");
-    assert!(!example.contains("VITE_SUPABASE_URL="), "{example}");
+        .example("APP=1\n");
+    run(via_add.path(), &["add", "service", "supabase", "--yes"]).assert_code(0);
+    let via_init = Project::new();
+    run(
+        via_init.path(),
+        &["init", "--with", "vite,supabase", "--yes"],
+    )
+    .assert_code(0);
+    let block = |text: &str| -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("VITE_SUPABASE_"))
+            .flat_map(|(i, l)| [lines[i - 1].to_string(), l.to_string()])
+            .collect()
+    };
+    let added = block(&via_add.read(".env.example"));
+    assert_eq!(
+        added.len(),
+        4,
+        "two copies, each with its comment: {added:?}"
+    );
+    assert_eq!(added, block(&via_init.read(".env.example")));
+}
+
+/// BR-1: no browser framework, no copies, and one line saying so; a service
+/// with no public values says nothing at all.
+#[test]
+fn no_browser_framework_no_copies() {
+    let p = Project::new().example("APP=1\n");
+    run(p.path(), &["add", "service", "supabase", "--yes"])
+        .assert_code(0)
+        .assert_contains("No browser framework found in this project");
+    assert!(!p.read(".env.example").contains("VITE_"));
+    run(p.path(), &["add", "service", "postgresql", "--yes"])
+        .assert_code(0)
+        .assert_not_contains("browser");
+}
+
+/// N-11 in `init --from-source` (fixed in 0.10.2, AD-S): it appends through
+/// `add`'s planner, so a name the user already set in `.env` is not appended
+/// there again below the real value.
+#[test]
+fn init_from_source_keeps_the_real_env_value() {
+    let p = Project::new()
+        .file("src/app.ts", "const u = process.env.REDIS_URL;\n")
+        .example("APP=1\n")
+        .env(&format!("APP=1\n{REAL_REDIS}\n"))
+        .file(".gitignore", ".env\n");
+    run(p.path(), &["init", "--from-source", "--yes"]).assert_code(0);
+    assert_eq!(p.count_lines(".env.example", "REDIS_URL="), 1);
+    assert_eq!(p.count_lines(".env", "REDIS_URL="), 1);
+    assert_eq!(
+        effective(&p.read(".env"), "REDIS_URL").as_deref(),
+        Some(REAL_REDIS)
+    );
+}
+
+/// Flags `add` owns go before or after the subcommand, as they always have
+/// (`-p` and `--yes` are global to it). Found while turning the training demo
+/// into tests: a clap setting added for `--list` refused the first form.
+#[test]
+fn add_flags_work_before_the_subcommand() {
+    let p = Project::new().dir("api");
+    run(
+        p.path(),
+        &["add", "--path", "api", "--yes", "service", "redis"],
+    )
+    .assert_code(0);
+    run(
+        p.path(),
+        &["add", "-p", "api", "service", "stripe", "--yes"],
+    )
+    .assert_code(0);
+    run(p.path(), &["add", "--dry-run", "service", "sentry"]).assert_code(0);
+    assert_eq!(p.count_lines("api/.env.example", "REDIS_URL="), 1);
+    assert_eq!(p.count_lines("api/.env.example", "STRIPE_SECRET_KEY="), 1);
+    assert_eq!(p.count_lines("api/.env.example", "SENTRY_DSN="), 0);
+    run(p.path(), &["add", "--list", "service", "redis"])
+        .assert_code(2)
+        .assert_contains("--list takes no subcommand");
 }

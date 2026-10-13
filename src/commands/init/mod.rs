@@ -19,9 +19,9 @@ use std::path::Path;
 mod architect;
 mod blank;
 mod blueprint;
-mod components;
-mod detect;
-mod shared;
+pub(crate) mod components;
+pub(crate) mod detect;
+pub(crate) mod shared;
 mod source;
 
 pub use shared::{write_env_files, WriteOptions};
