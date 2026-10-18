@@ -82,6 +82,16 @@ pub enum AddTarget {
         /// Mark every variable given as required.
         #[arg(long)]
         required: bool,
+
+        /// Mark every variable given as optional.
+        ///
+        /// With a `[vars]` contract in `.evnx.toml` this writes
+        /// `required = false` for each name (what `add custom` declares by
+        /// default; the flag says so). `.env.example` alone cannot say
+        /// "optional": without a contract the variables are still added, and
+        /// the run says how to make them optional (`evnx spec init`).
+        #[arg(long, conflicts_with = "required")]
+        optional: bool,
     },
 }
 
@@ -1611,11 +1621,27 @@ pub enum Commands {
         /// boolean traps. Only `.env` is written, the template is never touched,
         /// and the original is kept beside it as `.env.bak`.
         ///
+        /// A missing variable gets the template's value. A new secret is
+        /// generated only for one the app holds alone — its own signing key
+        /// (`SECRET_KEY`, `JWT_SECRET`, `SESSION_SECRET`, …) or a password; a
+        /// key a provider issues (`STRIPE_KEY`, an AWS secret, a token) gets a
+        /// placeholder, because evnx cannot invent it. Those are listed under
+        /// "Needs your input", not as fixed, and the run exits 1 until they are
+        /// filled in.
+        ///
         /// ⛔ **It will not overwrite a value that is not a placeholder.** A
         /// weak secret with a real value behind it is reported and left alone —
         /// see `--rotate-weak-secrets`.
         #[arg(long)]
         fix: bool,
+
+        /// With `--fix`, show what it would change and write nothing.
+        ///
+        /// No `.env` change and no backup. The report and the exit code are
+        /// those of the file as it stands; a secret `--fix` would generate is
+        /// not shown, because the real run makes a new one.
+        #[arg(long, requires = "fix")]
+        dry_run: bool,
 
         /// With `--fix`, also replace weak secrets that hold a **real value**.
         ///
@@ -1635,7 +1661,9 @@ pub enum Commands {
         /// you can.
         ///
         /// Rotate at the provider first. A new value here that the provider
-        /// does not have is an outage, not a repair.
+        /// does not have is an outage, not a repair — so a key a provider
+        /// issues is never replaced, even with this flag: only the app's own
+        /// secrets and passwords are.
         #[arg(long, requires = "fix")]
         rotate_weak_secrets: bool,
 
@@ -1657,12 +1685,23 @@ pub enum Commands {
         exit_zero: bool,
 
         /// Comma-separated list of issue types to ignore
+        ///
+        /// Added to `[validate] ignore` in `.evnx.toml`. An unknown type is an
+        /// error that lists the valid ones, so a typo cannot silence nothing.
         #[arg(long, value_delimiter = ',')]
         ignore: Vec<String>,
 
         /// Validate value formats: url, port, email
         #[arg(long)]
         validate_formats: bool,
+
+        /// The lowest severity that fails the run: `error` or `warning`.
+        ///
+        /// Defaults to `error`, or `[validate] fail_on` from `.evnx.toml`.
+        /// `warning` makes warnings exit 1 too, for gates that want them
+        /// fixed. `--exit-zero` still wins.
+        #[arg(long, value_name = "LEVEL")]
+        fail_on: Option<String>,
     },
 
     /// Detect secrets that look real (AWS keys, tokens, etc.).

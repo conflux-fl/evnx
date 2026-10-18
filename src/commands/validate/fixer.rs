@@ -8,8 +8,6 @@
 // use std::collections::HashMap;
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -37,6 +35,9 @@ pub enum WeakSecretPolicy {
 #[derive(Debug, Clone)]
 pub enum FixAction {
     GenerateSecret,
+    /// A missing variable evnx may generate a value for (DEC-VA6): added with
+    /// a new secret in one run, rather than a placeholder and a second run.
+    AddSecret,
     ReplacePlaceholder(String),
     FixBoolean(String),
     AddMissing(String),
@@ -65,12 +66,20 @@ pub fn suggest_fix(
 ) -> FixAction {
     match issue_type {
         IssueType::PlaceholderValue => {
-            // ⚠️ The same rule the weak-secret check uses, so `DB_PASSWORD`
-            // and `API_TOKEN` are treated like `SECRET_KEY` rather than falling
-            // through to "evnx cannot invent this".
-            if crate::core::classify::is_secret_name(key, crate::core::classify::Strictness::Strict)
-            {
+            // ⛔ I-260 (DEC-VA4): generated only for a secret nothing outside
+            // the app has to hold — its own signing key, or a password it
+            // chooses. This generated for **every** secret-shaped name, so
+            // `STRIPE_KEY=changeme` became 64 random hex characters that then
+            // passed validate: a fake provider key, reported as fixed.
+            if crate::core::classify::may_generate(key) {
                 FixAction::GenerateSecret
+            } else if crate::core::classify::is_secret_name(
+                key,
+                crate::core::classify::Strictness::Strict,
+            ) {
+                // A key someone else issues. The finding stays, and does not
+                // offer `--fix`; the person fetches the value.
+                FixAction::Skip
             } else if key.contains("PORT") {
                 // `8080` is a **working default**, not a stand-in — a port is
                 // not a credential and the value is immediately usable.
@@ -141,27 +150,52 @@ pub fn suggest_fix(
         // keeps the advice it already carried ("Run: openssl rand -hex 32"),
         // which the person can act on with the old value still in front of
         // them.
+        //
+        // ⛔ And only for a secret evnx may generate at all (I-260): the
+        // `--rotate-weak-secrets` flag included (DEC-VA5). A provider always
+        // holds its key, so a value invented here never matches it.
         IssueType::WeakSecret => {
-            if super::checks::is_placeholder(key, value) || weak_secrets == WeakSecretPolicy::Rotate
+            if crate::core::classify::may_generate(key)
+                && (super::checks::is_placeholder(key, value)
+                    || weak_secrets == WeakSecretPolicy::Rotate)
             {
                 FixAction::GenerateSecret
             } else {
                 FixAction::Skip
             }
         }
-        IssueType::MissingVariable => {
-            let default = if crate::core::classify::is_secret_name(
-                key,
-                crate::core::classify::Strictness::Strict,
-            ) {
-                "CHANGE_ME_SECURE_32_CHARS_MIN"
-            } else {
-                "your_value_here"
-            };
-            FixAction::AddMissing(default.to_string())
+        // A missing variable has no value. One evnx may generate is added
+        // with a new secret (DEC-VA6); for the rest, the caller that knows the
+        // template uses [`fill_for_missing`] with it.
+        IssueType::MissingVariable if crate::core::classify::may_generate(key) => {
+            FixAction::AddSecret
         }
+        IssueType::MissingVariable => FixAction::AddMissing(fill_for_missing(key, None)),
         _ => FixAction::Skip,
     }
+}
+
+/// What `--fix` writes for a variable the file lacks (I-037, D-25).
+///
+/// - A secret-shaped name gets the generic placeholder: evnx cannot invent a
+///   Stripe key, and a template's value for a secret is never copied — a
+///   sample key that does not look like a placeholder would then pass. (A
+///   secret evnx may generate never gets here: it is `FixAction::AddSecret`.)
+/// - Anything else gets the template's own value, whatever it is: `8080`,
+///   `localhost`, a documentation URL, or nothing at all for `OPTIONAL_X=`.
+///   The template is committed, so copying it reveals nothing, and it is what
+///   `cp .env.example .env` would have given. It replaced `your_value_here`
+///   for every name, which threw away the one hint the template carried.
+/// - A name the template does not have (a contract requires it) gets
+///   `your_value_here`.
+///
+/// Whether the result still needs a person is [`super::checks::is_placeholder`]'s
+/// call, made by the report — not this function's.
+pub fn fill_for_missing(key: &str, template_value: Option<&str>) -> String {
+    if crate::core::classify::is_secret_name(key, crate::core::classify::Strictness::Strict) {
+        return "CHANGE_ME_SECURE_32_CHARS_MIN".to_string();
+    }
+    template_value.unwrap_or("your_value_here").to_string()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -265,6 +299,18 @@ pub fn apply_fix(
                 new_value: new_val.clone(),
             })
         }
+        FixAction::AddSecret => {
+            let new_val = generate_secure_secret();
+            env_vars.insert(key.to_string(), new_val.clone());
+            Some(FixApplied {
+                variable: key.to_string(),
+                action: "Added a generated secret".to_string(),
+                // There was no previous value.
+                old_value: None,
+                old_value_withheld: false,
+                new_value: new_val,
+            })
+        }
         FixAction::AddMissing(new_val) => {
             env_vars.insert(key.to_string(), new_val.clone());
             Some(FixApplied {
@@ -323,12 +369,19 @@ pub fn apply_fix(
 /// 2. **A value this function writes is quoted when it would not survive being
 ///    read back.** The bug above was a write that could not be re-read; the
 ///    guard belongs at the write.
+///
+/// The backup is [`crate::core::safe_write::backup`] (numbered, never
+/// overwritten, the original's mode) and the write is
+/// [`crate::core::safe_write::write_private`]: atomic, the file keeps its mode,
+/// and a symlinked `.env` is written through with the link left in place. It
+/// was a truncate-in-place `fs::write`, the last `.env` writer that was not on
+/// the shared path (C-04).
 pub fn write_fixed_file(
     env_path: &str,
     env_vars: &IndexMap<String, String>,
     original_content: &str,
     changed: &BTreeSet<String>,
-) -> Result<String> {
+) -> Result<(String, crate::core::safe_write::Written)> {
     let mut output = String::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
 
@@ -392,9 +445,10 @@ pub fn write_fixed_file(
         }
     }
 
-    let backup = write_backup(env_path, original_content)?;
-    fs::write(env_path, output).with_context(|| format!("Failed to write fixes to {env_path}"))?;
-    Ok(backup)
+    let backup = crate::core::safe_write::backup(env_path, original_content.as_bytes())?;
+    let written = crate::core::safe_write::write_private(env_path, output.as_bytes())
+        .with_context(|| format!("Failed to write fixes to {env_path}"))?;
+    Ok((backup.to_string_lossy().into_owned(), written))
 }
 
 /// The variable a line assigns, or `None` if it assigns nothing.
@@ -428,45 +482,6 @@ fn render_value(_key: &str, value: &str) -> Result<String> {
     Ok(crate::core::envfile::quote(value).into_owned())
 }
 
-/// Copy the file aside before overwriting it, and never clobber an earlier copy.
-///
-/// ⚠️ `--fix` edits a credentials file in place. Until 2026-10-07 it did so with
-/// no undo at all: the run that replaced a working `DATABASE_PASSWORD` with
-/// random hex left nothing to recover it from.
-///
-/// `.env.bak`, then `.env.bak.2`, `.env.bak.3` … rather than `sed -i.bak`'s
-/// overwrite, because two `--fix` runs would otherwise leave a "backup" of the
-/// already-damaged file and no copy of the original.
-fn write_backup(env_path: &str, original_content: &str) -> Result<String> {
-    let mut candidate = format!("{env_path}.bak");
-    let mut n = 2;
-    while Path::new(&candidate).exists() {
-        candidate = format!("{env_path}.bak.{n}");
-        n += 1;
-        if n > 100 {
-            anyhow::bail!(
-                "refusing to write fixes: {env_path}.bak through {env_path}.bak.100 all exist — \
-                 remove some before running --fix again"
-            );
-        }
-    }
-    fs::write(&candidate, original_content)
-        .with_context(|| format!("Failed to write a backup to {candidate}"))?;
-
-    // The backup holds the same credentials the original did, so it gets the
-    // same permissions rather than the process umask's.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(env_path)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        let _ = fs::set_permissions(&candidate, fs::Permissions::from_mode(mode));
-    }
-
-    Ok(candidate)
-}
-
 // ─────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────
@@ -474,6 +489,7 @@ fn write_backup(env_path: &str, original_content: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     // ─────────────────────────────────────────────────────────
     // S1 — `--fix` must not destroy what it was pointed at
@@ -498,7 +514,7 @@ mod tests {
             .collect();
         let set: BTreeSet<String> = changed.iter().map(|k| k.to_string()).collect();
 
-        let backup =
+        let (backup, _) =
             write_fixed_file(path.to_str().unwrap(), &map, original, &set).expect("write failed");
         assert_eq!(
             fs::read_to_string(&backup).unwrap(),
@@ -713,12 +729,12 @@ mod tests {
         fs::write(&path, first).unwrap();
         let mut map = IndexMap::new();
         map.insert("A".to_string(), "two".to_string());
-        let b1 =
+        let (b1, _) =
             write_fixed_file(p, &map, first, &["A".to_string()].into_iter().collect()).unwrap();
 
         let second = fs::read_to_string(&path).unwrap();
         map.insert("A".to_string(), "three".to_string());
-        let b2 =
+        let (b2, _) =
             write_fixed_file(p, &map, &second, &["A".to_string()].into_iter().collect()).unwrap();
 
         assert_ne!(b1, b2, "the second run overwrote the first backup");
@@ -730,12 +746,48 @@ mod tests {
     #[test]
     fn test_suggest_fix_placeholder_secret() {
         let action = suggest_fix(
-            "API_KEY",
+            "SECRET_KEY",
             "changeme",
             &IssueType::PlaceholderValue,
             WeakSecretPolicy::PlaceholdersOnly,
         );
         assert!(matches!(action, FixAction::GenerateSecret));
+    }
+
+    /// I-260: this test asserted `API_KEY=changeme` → a generated value, which
+    /// is the bug. A key someone else issues is never invented, not even under
+    /// `--rotate-weak-secrets` (DEC-VA5).
+    #[test]
+    fn t_i260_a_provider_key_is_never_generated() {
+        for (ty, policy) in [
+            (
+                IssueType::PlaceholderValue,
+                WeakSecretPolicy::PlaceholdersOnly,
+            ),
+            (IssueType::WeakSecret, WeakSecretPolicy::PlaceholdersOnly),
+            (IssueType::WeakSecret, WeakSecretPolicy::Rotate),
+        ] {
+            let action = suggest_fix("API_KEY", "changeme", &ty, policy);
+            assert!(matches!(action, FixAction::Skip), "{ty:?} {policy:?}");
+        }
+        assert!(matches!(
+            suggest_fix(
+                "STRIPE_KEY",
+                "",
+                &IssueType::MissingVariable,
+                WeakSecretPolicy::PlaceholdersOnly
+            ),
+            FixAction::AddMissing(_)
+        ));
+        assert!(matches!(
+            suggest_fix(
+                "SECRET_KEY",
+                "",
+                &IssueType::MissingVariable,
+                WeakSecretPolicy::PlaceholdersOnly
+            ),
+            FixAction::AddSecret
+        ));
     }
 
     #[test]
