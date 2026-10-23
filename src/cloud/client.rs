@@ -89,6 +89,19 @@ pub enum ApiError {
     #[error("your session has expired. Run `evnx auth login` to sign in again.")]
     Unauthorized,
 
+    /// 401 to an `EVNX_TOKEN` API token (I-302, DEC-AU302).
+    ///
+    /// ⚠️ Not [`ApiError::Unauthorized`]. A token has no session to expire and
+    /// no refresh, and the job that holds one usually cannot run `evnx auth
+    /// login` — so "your session has expired" named the wrong cause and a fix
+    /// it could not carry out.
+    #[error(
+        "the API token in EVNX_TOKEN was refused — it has been revoked, has expired, \
+         or is mistyped. Create a new one on a signed-in machine with \
+         `evnx auth token create`, and replace the secret where this job reads it."
+    )]
+    TokenRejected,
+
     /// 403 `EMAIL_NOT_VERIFIED`.
     #[error(
         "your email address is not verified yet — check your inbox for the link from evnx. \
@@ -168,6 +181,18 @@ pub enum ApiError {
         server: String,
         /// Shortest useful description of what went wrong.
         reason: String,
+    },
+
+    /// A refusal with a code this build does not know, and a sentence that
+    /// says what was wrong (I-306). The sentence is the message: the server
+    /// writes it for the person reading, and a code added after this build was
+    /// released is no reason to drop it.
+    #[error("{message}")]
+    Refused {
+        /// Status returned.
+        status: u16,
+        /// The server's sentence.
+        message: String,
     },
 
     /// A status or body this client does not know how to interpret.
@@ -492,7 +517,8 @@ impl Client {
         Ok(())
     }
 
-    /// Send with a bearer token, refreshing once if the server says 401.
+    /// Send with a bearer token, refreshing once if the server says 401 — or
+    /// says the email is not verified (I-301).
     ///
     /// Takes a builder closure rather than a `RequestBuilder` because the request
     /// may need to be constructed twice and `RequestBuilder` is not `Clone`.
@@ -501,32 +527,48 @@ impl Client {
         path: &str,
         build: impl Fn(&reqwest::blocking::Client, String) -> reqwest::blocking::RequestBuilder,
     ) -> Result<T, ApiError> {
-        let token = self.access_token()?;
-        let resp = build(&self.http, self.url(path))
-            .bearer_auth(token.expose())
-            .send()
-            .map_err(|e| ApiError::Transport {
-                server: self.server.clone(),
-                reason: crate::core::http::transport_reason(&e, REQUEST_TIMEOUT),
-            })?;
+        let send = || -> Result<reqwest::blocking::Response, ApiError> {
+            let token = self.access_token()?;
+            build(&self.http, self.url(path))
+                .bearer_auth(token.expose())
+                .send()
+                .map_err(|e| ApiError::Transport {
+                    server: self.server.clone(),
+                    reason: crate::core::http::transport_reason(&e, REQUEST_TIMEOUT),
+                })
+        };
 
+        let resp = send()?;
         if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
-            return self.decode(resp, path);
+            return match self.decode(resp, path) {
+                // ⚠️ I-301, DEC-AU301. An access token carries `email_verified`
+                // from when it was issued, so one issued before the link was
+                // opened says "unverified" for up to 15 minutes — while
+                // `auth status`, which asks the server, says "verified yes".
+                // A refresh reissues it from the database. Once, and only for
+                // a session: an API token has no refresh path.
+                //
+                // Retrying is safe for every method, POST included: the only
+                // place the server answers EMAIL_NOT_VERIFIED is the
+                // `require_verified` guard, before any handler runs.
+                //
+                // A refresh that fails is not the answer to "is my email
+                // verified" — the original refusal is.
+                Err(ApiError::EmailNotVerified) if !self.is_api_token() => {
+                    if self.refresh().is_err() {
+                        return Err(ApiError::EmailNotVerified);
+                    }
+                    self.decode(send()?, path)
+                }
+                other => other,
+            };
         }
 
         // Exactly one attempt. If the refresh token is also dead, `refresh`
         // returns Unauthorized and we stop rather than looping.
         drop(resp);
         self.refresh()?;
-        let token = self.access_token()?;
-        let resp = build(&self.http, self.url(path))
-            .bearer_auth(token.expose())
-            .send()
-            .map_err(|e| ApiError::Transport {
-                server: self.server.clone(),
-                reason: crate::core::http::transport_reason(&e, REQUEST_TIMEOUT),
-            })?;
-        self.decode(resp, path)
+        self.decode(send()?, path)
     }
 
     /// The current access token, refreshing first if it is expired or near it.
@@ -568,7 +610,7 @@ impl Client {
         if self.is_api_token() {
             // A 401 on an API token means revoked, expired, or wrong — none of
             // which a refresh could fix. Retrying would just repeat it.
-            return Err(ApiError::Unauthorized);
+            return Err(ApiError::TokenRejected);
         }
 
         let refresh_token = {
@@ -649,6 +691,8 @@ impl Client {
             error: String::new(),
             code: String::new(),
         });
+        // A real sentence from the server, as opposed to the placeholder below.
+        let has_sentence = !parsed.error.trim().is_empty();
         let message = if parsed.error.is_empty() {
             format!("HTTP {}", status.as_u16())
         } else {
@@ -685,6 +729,11 @@ impl Client {
                     server: self.server.clone(),
                     status: s,
                 },
+                // ⚠️ I-306: a code this build does not know, with a sentence —
+                // keep the sentence. It said "unexpected response: HTTP 403"
+                // and dropped it, which is what made a new code impossible to
+                // add without breaking every installed CLI.
+                s if has_sentence => ApiError::Refused { status: s, message },
                 s => ApiError::Unexpected {
                     server: self.server.clone(),
                     status: s,
@@ -877,6 +926,190 @@ mod tests {
         assert!(matches!(err, ApiError::Forbidden { .. }), "{err:?}");
         assert!(!err.to_string().contains("inbox"));
         m2.assert();
+    }
+
+    // ─── I-301: a session issued before the email was verified ──────────────
+
+    const NOT_VERIFIED: &str =
+        r#"{"error":"Please verify your email first","code":"EMAIL_NOT_VERIFIED"}"#;
+
+    /// The access token carries `email_verified` from when it was issued, so
+    /// one issued before the link was opened says "unverified" for up to 15
+    /// minutes. A refresh reissues it from the database.
+    #[test]
+    #[serial]
+    fn t_i301_a_session_issued_before_verifying_is_refreshed_once_and_retried() {
+        let _g = ConfigDirGuard::new();
+        let mut server = mockito::Server::new();
+        signed_in(&server.url(), 4_000_000_000).save().unwrap();
+        let client = Client::new(server.url()).unwrap();
+
+        let stale = server
+            .mock("GET", "/api/v1/vaults")
+            .match_header("authorization", "Bearer access-1")
+            .with_status(403)
+            .with_body(NOT_VERIFIED)
+            .expect(1)
+            .create();
+        // A readable `exp`, or the client treats the new token as stale at
+        // once and refreshes again before the retry.
+        let reissued = jwt_with_exp(4_000_000_000);
+        let refresh = server
+            .mock("POST", "/api/v1/auth/refresh")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"refresh_token":"refresh-1"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"access_token":"{reissued}","refresh_token":"refresh-2"}}"#
+            ))
+            .expect(1)
+            .create();
+        let fresh = server
+            .mock("GET", "/api/v1/vaults")
+            .match_header("authorization", format!("Bearer {reissued}").as_str())
+            .with_status(200)
+            .with_body("[]")
+            .expect(1)
+            .create();
+
+        let _: Vec<serde_json::Value> = client.get("/api/v1/vaults").unwrap();
+        stale.assert();
+        refresh.assert();
+        fresh.assert();
+        // The rotated refresh token is the one kept: the old one is revoked.
+        let saved = Store::load().unwrap();
+        assert_eq!(
+            saved.session(&server.url()).unwrap().refresh_token.expose(),
+            "refresh-2"
+        );
+    }
+
+    /// Genuinely unverified: one refresh, one retry, then today's message.
+    #[test]
+    #[serial]
+    fn t_i301_still_unverified_after_the_refresh_is_reported_after_one_retry() {
+        let _g = ConfigDirGuard::new();
+        let mut server = mockito::Server::new();
+        signed_in(&server.url(), 4_000_000_000).save().unwrap();
+        let client = Client::new(server.url()).unwrap();
+
+        let vaults = server
+            .mock("GET", "/api/v1/vaults")
+            .with_status(403)
+            .with_body(NOT_VERIFIED)
+            .expect(2)
+            .create();
+        let refresh = server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"access_token":"{}","refresh_token":"refresh-2"}}"#,
+                jwt_with_exp(4_000_000_000)
+            ))
+            .expect(1)
+            .create();
+
+        let err = client
+            .get::<serde_json::Value>("/api/v1/vaults")
+            .unwrap_err();
+        assert!(matches!(err, ApiError::EmailNotVerified), "{err:?}");
+        vaults.assert();
+        refresh.assert();
+    }
+
+    /// A refresh that fails is not the answer to "is my email verified":
+    /// the original refusal is.
+    #[test]
+    #[serial]
+    fn t_i301_a_failed_refresh_still_reports_not_verified() {
+        let _g = ConfigDirGuard::new();
+        let mut server = mockito::Server::new();
+        signed_in(&server.url(), 4_000_000_000).save().unwrap();
+        let client = Client::new(server.url()).unwrap();
+
+        let vaults = server
+            .mock("GET", "/api/v1/vaults")
+            .with_status(403)
+            .with_body(NOT_VERIFIED)
+            .expect(1)
+            .create();
+        let refresh = server
+            .mock("POST", "/api/v1/auth/refresh")
+            .with_status(401)
+            .with_body(r#"{"error":"Authentication failed","code":"UNAUTHORIZED"}"#)
+            .expect(1)
+            .create();
+
+        let err = client
+            .get::<serde_json::Value>("/api/v1/vaults")
+            .unwrap_err();
+        assert!(matches!(err, ApiError::EmailNotVerified), "{err:?}");
+        vaults.assert();
+        refresh.assert();
+    }
+
+    // ─── I-306: a code this build does not know ─────────────────────────────
+
+    /// A code added to the server after this build (`PLAN_LIMIT` was the first
+    /// one considered) fell back to the status, and 403 printed "unexpected
+    /// response from …: HTTP 403" — the sentence explaining the refusal lost.
+    #[test]
+    #[serial]
+    fn t_i306_an_unknown_code_keeps_the_servers_sentence() {
+        let _g = ConfigDirGuard::new();
+        let mut server = mockito::Server::new();
+        signed_in(&server.url(), 4_000_000_000).save().unwrap();
+        let client = Client::new(server.url()).unwrap();
+
+        for (status, path, body, said) in [
+            (
+                403,
+                "/api/v1/a",
+                r#"{"error":"your plan (free) allows 3 vaults.","code":"PLAN_LIMIT"}"#,
+                "your plan (free) allows 3 vaults.",
+            ),
+            (
+                418,
+                "/api/v1/b",
+                r#"{"error":"a sentence from a newer server","code":"SOMETHING_NEW"}"#,
+                "a sentence from a newer server",
+            ),
+        ] {
+            let m = server
+                .mock("GET", path)
+                .with_status(status)
+                .with_body(body)
+                .create();
+            let err = client.get::<serde_json::Value>(path).unwrap_err();
+            assert_eq!(err.to_string(), said, "{err:?}");
+            m.assert();
+        }
+    }
+
+    /// No sentence to keep — a proxy's error page — still names the status.
+    #[test]
+    #[serial]
+    fn t_i306_a_body_without_a_sentence_still_names_the_status() {
+        let _g = ConfigDirGuard::new();
+        let mut server = mockito::Server::new();
+        signed_in(&server.url(), 4_000_000_000).save().unwrap();
+        let client = Client::new(server.url()).unwrap();
+
+        let m = server
+            .mock("GET", "/api/v1/vaults")
+            .with_status(403)
+            .with_header("content-type", "text/html")
+            .with_body("<html><body>Forbidden by proxy</body></html>")
+            .create();
+        let err = client
+            .get::<serde_json::Value>("/api/v1/vaults")
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Unexpected { status: 403, .. }),
+            "{err:?}"
+        );
+        m.assert();
     }
 
     #[test]

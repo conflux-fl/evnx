@@ -8,6 +8,58 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The patch for `evnx auth` (package R-auth).
+
+- **`evnx auth status` says why a paid organisation is not raising your plan**
+  (I-321). The server applies the plan of the organisation you hold a seat in,
+  else your own, and paying for seats hands none out: an organisation's owner
+  is created without one. A customer whose organisation pays for Team saw
+  `plan (free)` and nothing else, which reads like a failed payment. Under the
+  plan block, `status` now names each organisation on a higher plan where you
+  hold no seat, and the next step: `evnx org assign <you> --org <slug>` for an
+  owner or admin with a seat free; release one or raise the count when every
+  seat is taken; who to ask, for a member; and that your one seat is elsewhere,
+  with the `evnx org release` that frees it. `-q` leaves it out, and if
+  `GET /orgs` fails the block is left out rather than failing `status`.
+  app.evnx.dev shows the same notice.
+- **No second sign-in after verifying your email** (I-301, DEC-AU301). The
+  session's access token carries `email_verified` from when it was issued, so
+  for up to 15 minutes after the link was opened every vault command said
+  "your email address is not verified yet" while `evnx auth status` said
+  `verified  yes`. When the server answers EMAIL_NOT_VERIFIED to a signed-in
+  session, the CLI now refreshes the session once and retries the request; the
+  refreshed token is issued from the database. Still unverified after that,
+  the message is as before. API tokens have no refresh and are unchanged.
+- **A refused API token says so** (I-302, DEC-AU302; the auth I-302 in the
+  review's `issues.csv` — #219 reused the number for `init`). A revoked,
+  expired or mistyped `EVNX_TOKEN` was reported as "your session has expired.
+  Run `evnx auth login`", the wrong cause and a fix a CI job cannot run. It now
+  reads "the API token in EVNX_TOKEN was refused", with `evnx auth token
+  create` as the fix, and `evnx auth status` shows `status  API token refused`
+  instead of `session expired`. The exit code is unchanged (2; `status` 0). An
+  expired login still says to run `evnx auth login`.
+- **`evnx auth login --help` and `evnx auth totp --help` say CI uses API
+  tokens** (DEC-AU11). A second factor cannot be scripted, by design, and a
+  pipeline wired to `login` found out only when it stopped for a code. Both
+  now point unattended jobs at `evnx auth token create` and `EVNX_TOKEN`. Help
+  text only; the one-line summaries in `evnx auth --help` are unchanged.
+- **README: the whole of `evnx auth`, and where it keeps your login** (D-148,
+  D-150, DEC-AU9). The README named 3 of the 19 auth commands and gave
+  `~/.config/evnx/config.toml` as the only config path, which is right on Linux
+  alone. A new "Your account" section lists all 19, the folder on Linux, macOS
+  and Windows, `EVNX_CONFIG_DIR`, `config.toml` and `credentials.json` (mode
+  0600), and the three environment variables. A test checks the table against
+  the CLI in both directions, so a command added or renamed later fails it.
+- **An error code this build does not know keeps the server's sentence**
+  (I-306). It printed "unexpected response from …: HTTP 403" and dropped the
+  sentence that said what was wrong — which is why the server could not give
+  plan limits a code of their own without breaking every installed CLI. A
+  refusal with an unrecognised code and a sentence now prints the sentence;
+  one with no sentence (a proxy's error page) still names the status. The
+  server marks plan limits with `"reason": "PLAN_LIMIT"` beside `code:
+  FORBIDDEN` (evnx-server, SV-4), which every version of the CLI reads as
+  before.
+
 ## [0.10.16] - 2026-10-22
 
 The patch for `evnx init` (package R-init: #217, #218, #219). init now keeps

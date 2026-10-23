@@ -544,6 +544,21 @@ pub fn status(server_override: Option<&str>, verbose: bool) -> Result<()> {
             }
             return Ok(());
         }
+        // I-302: the same, for an API token — it does not expire as a session
+        // does, and the fix is a new token rather than a login.
+        Err(crate::cloud::client::ApiError::TokenRejected) => {
+            if !quiet {
+                println!("{}", "evnx account".bold());
+            }
+            println!("  server    {server}");
+            println!("  using     API token (from {})", super::client::ENV_TOKEN);
+            println!("  status    {}", "API token refused".yellow());
+            if !quiet {
+                println!("  It has been revoked, has expired, or is mistyped. Create a new one");
+                println!("  on a signed-in machine with `evnx auth token create`.");
+            }
+            return Ok(());
+        }
         Err(e) => return Err(anyhow!("{e}")),
     };
 
@@ -598,6 +613,18 @@ pub fn status(server_override: Option<&str>, verbose: bool) -> Result<()> {
     // changes.
     if let Ok(u) = client.get::<UsageResponse>("/api/v1/auth/usage") {
         print_usage(&u);
+
+        // Why a paid organisation is not raising that plan (I-321). Advice, so
+        // `-q` drops it, and best-effort like the block above: `/orgs` failing
+        // leaves the answer as it was rather than turning it into an error.
+        if !quiet {
+            if let Ok(orgs) = super::org::fetch_orgs(&client) {
+                let via = u.plan_via.as_ref().map(|v| v.slug.as_str());
+                for line in super::org::seat_notice(&orgs, &u.plan, via, &me.email) {
+                    println!("{line}");
+                }
+            }
+        }
     }
 
     Ok(())
