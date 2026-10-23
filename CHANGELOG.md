@@ -8,7 +8,37 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The patch for `evnx auth` (package R-auth).
+## [0.10.17] - 2026-10-23
+
+The patch for `evnx auth` (package R-auth, #221). `evnx auth status` says why a
+paid organisation is not raising your plan; vault commands work right after the
+verification link is opened, without signing in again; a refused API token is
+reported as one, not as an expired session; the `login` and `totp` help point
+CI at API tokens; the README covers all of `evnx auth`; and an error code this
+build does not know keeps the server's sentence.
+
+⚠️ **Scripts that read `evnx auth` output:** with a refused `EVNX_TOKEN`,
+`evnx auth status` prints `status  API token refused` where it printed
+`status  session expired`, and other commands print "the API token in
+EVNX_TOKEN was refused …" where they printed "your session has expired …".
+Exit codes are unchanged.
+
+ⓘ **Shipped separately, on evnx-server:** a 429 carries the real time left and
+a `Retry-After` header; malformed requests, unknown routes and wrong methods
+answer with `{error, code}`; plan limits add `"reason": "PLAN_LIMIT"`; login
+starts are limited to 30 per 15 minutes per address (wrong passwords still lock
+it after 5). This release behaves the same against the server before and after.
+
+🔒 **Security:** `ctutils` 0.4.2 → 0.4.5 (RUSTSEC-2026-0385, published
+2026-10-23: non-constant-time mask generation and `u128` comparisons). It sits
+under `ml-kem`, the post-quantum half of the key wrap `evnx vault share` uses,
+so the fix is a timing side channel in work done on your own machine. No
+change to what is encrypted or how; nothing to rotate.
+
+⚠️ **Building from source now needs Rust 1.87** (`rust-version` was 1.85).
+Every fixed `ctutils` release requires it. Only `cargo install evnx` on an older
+toolchain is affected; the npm, Homebrew, Scoop, winget, PyPI and GitHub
+Release binaries are built on stable as before.
 
 - **`evnx auth status` says why a paid organisation is not raising your plan**
   (I-321). The server applies the plan of the organisation you hold a seat in,
