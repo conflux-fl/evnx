@@ -24,13 +24,14 @@
 //! [`VaultKey`]: evnx_crypto::VaultKey
 
 use crate::cloud::client::api_path;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use super::auth;
 use super::client::{ApiError, Client};
 use super::config::CloudConfig;
+use super::role::{parse_role, VAULT_OWNER, VAULT_ROLES};
 
 /// AES-GCM nonce length — the prefix every stored blob carries.
 const NONCE_LEN: usize = 12;
@@ -77,13 +78,33 @@ pub(crate) fn fetch_and_resolve(client: &Client, target: &str) -> Result<VaultRe
         });
     }
 
-    let listed: VaultList = match client.get("/api/v1/vaults") {
-        Ok(l) => l,
+    let v = list_and_pick(client, target)?;
+    Ok(VaultRef {
+        id: v.id,
+        name: v.name,
+        environment: v.environment,
+    })
+}
+
+/// `GET /vaults`: every vault this account can reach.
+fn list_vaults(client: &Client) -> std::result::Result<Vec<VaultSummary>, ApiError> {
+    client.get::<VaultList>("/api/v1/vaults").map(|l| l.vaults)
+}
+
+/// List the vaults and pick the one `target` names: a name, `name/environment`,
+/// or an id among them.
+///
+/// The one place a target is looked up in the list (A-301). `vault members` and
+/// six other copies used to list and pick themselves, so a refused list came back
+/// bare, and an id was looked up although it needed no lookup (I-309).
+fn list_and_pick(client: &Client, target: &str) -> Result<VaultSummary> {
+    let vaults = match list_vaults(client) {
+        Ok(v) => v,
         Err(ApiError::Forbidden { .. }) if client.is_api_token() => {
             return Err(anyhow!(
                 "a vault-scoped API token cannot list vaults, so {target:?} cannot be \
                  resolved by name.\n\
-                 \x20 Pass the vault id instead:  --vault <uuid>\n\
+                 \x20 Pass the vault's id in place of its name.\n\
                  \x20 Find it with `evnx vault list --verbose` from a normal login. \
                  The restriction is deliberate — a token issued for one vault should \
                  not be able to enumerate the others."
@@ -91,13 +112,43 @@ pub(crate) fn fetch_and_resolve(client: &Client, target: &str) -> Result<VaultRe
         }
         Err(e) => return Err(anyhow!("{e}")),
     };
+    resolve(&vaults, target).cloned()
+}
 
-    let v = resolve(&listed.vaults, target)?;
+/// The name and environment of the vault with `id`, from `GET /vaults`.
+///
+/// For where a person will read the result (`cloud link`, I-221). An error if
+/// the id is not among the caller's vaults or the list cannot be fetched — a
+/// vault-scoped token cannot list, and then the name is not knowable.
+pub(crate) fn resolve_id(client: &Client, id: &str) -> Result<VaultRef> {
+    let vaults = list_vaults(client).map_err(|e| anyhow!("could not look up vault {id}: {e}"))?;
+    let v = vaults
+        .into_iter()
+        .find(|v| v.id == id)
+        .ok_or_else(|| anyhow!("no vault {id} among yours. Run `evnx vault list` to see them."))?;
     Ok(VaultRef {
-        id: v.id.clone(),
-        name: v.name.clone(),
-        environment: v.environment.clone(),
+        id: v.id,
+        name: v.name,
+        environment: v.environment,
     })
+}
+
+/// Every member's email by user id, for naming who did what (I-319). Empty when
+/// the list cannot be read; a caller then shows the id.
+pub(crate) fn member_emails(
+    client: &Client,
+    vault_id: &str,
+) -> std::collections::HashMap<String, String> {
+    api_path(&["vaults", vault_id, "members"])
+        .ok()
+        .and_then(|p| client.get::<MemberList>(&p).ok())
+        .map(|l| {
+            l.members
+                .into_iter()
+                .map(|m| (m.user_id, m.email))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Whether a string is a hyphenated UUID, and so already a vault id.
@@ -105,26 +156,6 @@ pub(crate) fn fetch_and_resolve(client: &Client, target: &str) -> Result<VaultRe
 /// Deliberately strict: a loose check that accepted a vault *name* would send the
 /// name straight to the API as an id and produce a 404 instead of the much more
 /// useful "no vault called …".
-/// The name and environment of the vault with `id`, from `GET /vaults`.
-///
-/// For where a person will read the result (`cloud link`, I-221). An error if
-/// the id is not among the caller's vaults or the list cannot be fetched — a
-/// vault-scoped token cannot list, and then the name is not knowable.
-pub(crate) fn resolve_id(client: &Client, id: &str) -> Result<VaultRef> {
-    let listed: VaultList = client
-        .get("/api/v1/vaults")
-        .map_err(|e| anyhow!("could not look up vault {id}: {e}"))?;
-    let v =
-        listed.vaults.iter().find(|v| v.id == id).ok_or_else(|| {
-            anyhow!("no vault {id} among yours. Run `evnx vault list` to see them.")
-        })?;
-    Ok(VaultRef {
-        id: v.id.clone(),
-        name: v.name.clone(),
-        environment: v.environment.clone(),
-    })
-}
-
 pub(crate) fn looks_like_vault_id(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -192,10 +223,10 @@ pub fn create(
     // vault key asks for the password. Caching it on disk would defeat the point
     // of the server never holding one.
     let password = auth::read_password(password_stdin, "Master password")?;
-    let master_key = auth::derive_master_key_for_account(&client, &password)?;
+    let unlocked = auth::unlock(&client, &password)?;
 
     let vault_key = VaultKey::generate();
-    let wrapped = wrap_vault_key_with_master_key(&vault_key, &master_key)
+    let wrapped = wrap_vault_key_with_master_key(&vault_key, &unlocked.master_key)
         .map_err(|e| anyhow!("wrapping the vault key: {e}"))?;
 
     let created: CreateVaultResponse = client
@@ -209,7 +240,7 @@ pub fn create(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!(
+    crate::say!(
         "  {} created {}/{}",
         "✓".green(),
         created.name,
@@ -219,8 +250,16 @@ pub fn create(
         println!("  vault id  {}", created.vault_id);
         println!("  key wrap  master key (no ECDH, no ephemeral)");
     }
-    println!();
-    println!("  Push a .env into it with:  {}", "evnx cloud push".cyan());
+    crate::say!();
+    // I-320: a bare `evnx cloud push` fails here — `create` binds no directory.
+    crate::say!(
+        "  Push a .env into it with:  {}",
+        format!(
+            "evnx cloud push --vault {}/{}",
+            created.name, created.environment
+        )
+        .cyan()
+    );
     Ok(())
 }
 
@@ -234,7 +273,7 @@ pub fn list(server_override: Option<&str>, verbose: bool) -> Result<()> {
 
     if listed.vaults.is_empty() {
         println!("  No vaults yet on {server}.");
-        println!("  Create one with:  {}", "evnx vault create".cyan());
+        crate::say!("  Create one with:  {}", "evnx vault create".cyan());
         return Ok(());
     }
 
@@ -301,8 +340,7 @@ pub fn delete(
         "\x20 Deleting a vault is for a signed-in member, not a pipeline — a leaked\n\x20 CI token must not be able to destroy it.\n",
     )?;
 
-    let listed: VaultList = client.get("/api/v1/vaults").map_err(|e| anyhow!("{e}"))?;
-    let vault = resolve(&listed.vaults, &target)?;
+    let vault = list_and_pick(&client, &target)?;
 
     if !assume_yes {
         println!(
@@ -312,11 +350,11 @@ pub fn delete(
             vault.version_count
         );
         println!("  {}", "There is no undelete in the CLI.".yellow());
-        let ok = crate::utils::prompt::yes_no()
-            .with_prompt(format!("Delete {}/{}?", vault.name, vault.environment))
-            .default(false)
-            .interact()
-            .context("reading the confirmation")?;
+        let ok = crate::utils::prompt::confirm(
+            &format!("Delete {}/{}?", vault.name, vault.environment),
+            false,
+            &format!("evnx vault delete {target} --yes"),
+        )?;
         if !ok {
             println!("  Cancelled; nothing was deleted.");
             return Ok(());
@@ -327,7 +365,7 @@ pub fn delete(
         .delete(&api_path(&["vaults", &vault.id.to_string()])?)
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!(
+    crate::say!(
         "  {} deleted {}/{}",
         "✓".green(),
         vault.name,
@@ -388,17 +426,10 @@ pub fn share(
     password_stdin: bool,
     verbose: bool,
 ) -> Result<()> {
-    use evnx_crypto::{unwrap_vault_key_with_master_key, wrap_vault_key_for_user, UserPublicKeys};
+    use evnx_crypto::{wrap_vault_key_for_user, UserPublicKeys};
 
     // Case-insensitive, like `--env` (I-223, DEC-CL8): `--role Admin` was refused.
-    let role = role.trim().to_lowercase();
-    let valid_roles = ["viewer", "developer", "admin"];
-    if !valid_roles.contains(&role.as_str()) {
-        return Err(anyhow!(
-            "role must be one of: {}. Got `{role}`.",
-            valid_roles.join(", ")
-        ));
-    }
+    let role = parse_role(&role, VAULT_ROLES, VAULT_OWNER)?;
 
     let recipient_email = recipient_email.trim().to_lowercase();
 
@@ -409,8 +440,78 @@ pub fn share(
         "\x20 Sharing decides who can read these secrets; a leaked CI token must\n\x20 not be able to add a reader.\n",
     )?;
 
-    let listed: VaultList = client.get("/api/v1/vaults").map_err(|e| anyhow!("{e}"))?;
-    let vault = resolve(&listed.vaults, &target)?;
+    let vault = list_and_pick(&client, &target)?;
+    let label = format!("{}/{}", vault.name, vault.environment);
+
+    // ── Already a member? Before the key lookup and the password ─────────────
+    //
+    // ⚠️ A share to a member rewrote their row, role and key (I-313, I-314):
+    // sharing with your own address turned an owner into a developer who could
+    // no longer delete the vault, and an admin "sharing" with the owner was the
+    // first step to removing them. The server refuses both since SV-3; refusing
+    // here spares the password prompt and says what would work instead.
+    let people: MemberList = client
+        .get(&api_path(&["vaults", &vault.id, "members"])?)
+        .map_err(|e| anyhow!("{e}"))?;
+    if let Some(m) = people
+        .members
+        .iter()
+        .find(|m| m.email.to_lowercase() == recipient_email)
+    {
+        if m.is_you {
+            return Err(anyhow!(
+                "That is you: you already hold {label} as {}. Sharing cannot change \
+                 your own role.",
+                m.role
+            ));
+        }
+        if m.role == "owner" {
+            return Err(anyhow!(
+                "{} owns {label}. Sharing cannot change the owner's role or key.",
+                m.email
+            ));
+        }
+        // The role they already hold: nothing to do, as `vault role` says for
+        // the same case — a script that shares twice stays green.
+        if m.role == role {
+            crate::say!(
+                "  {} is already {} {role} on {label} — nothing changed.",
+                m.email,
+                article(&role)
+            );
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "{} is already {} {} on {label}.\n\
+             \x20 To make them {role}:  evnx vault role {target} --user {} --role {role}",
+            m.email,
+            article(&m.role),
+            m.role,
+            m.email
+        ));
+    }
+
+    // ── May you share at that role? ──────────────────────────────────────────
+    //
+    // The server lets an owner or an admin share, and only a role below the
+    // sharer's own (I-311, DEC-VL5). A developer or viewer heard "re-sharing is
+    // not supported" after typing the password; say what it is, before.
+    if let Some(me) = people.members.iter().find(|m| m.is_you) {
+        if me.role != "owner" && me.role != "admin" {
+            return Err(anyhow!(
+                "sharing {label} needs the admin or owner role; you are {} {} on it.\n\
+                 \x20 Ask its owner, or an admin, to share it.",
+                article(&me.role),
+                me.role
+            ));
+        }
+        if me.role == "admin" && role == "admin" {
+            return Err(anyhow!(
+                "an admin can share {label} as viewer or developer; only the owner can \
+                 make someone an admin."
+            ));
+        }
+    }
 
     // ── The recipient's keys, before asking for a password ───────────────────
     //
@@ -453,35 +554,16 @@ pub fn share(
 
     // ── Open our copy, re-wrap for them ──────────────────────────────────────
     let password = auth::read_password(password_stdin, "Master password")?;
-    let master_key = auth::derive_master_key_for_account(&client, &password)?;
+    let unlocked = auth::unlock(&client, &password)?;
 
-    let my_key: MyWrappedKey = client
-        .get(&api_path(&["vaults", &vault.id.to_string(), "my-key"])?)
-        .map_err(|e| anyhow!("{e}"))?;
-
-    if my_key.eph_pub_key.is_some() {
-        // Re-sharing someone else's vault would need the account keypair rather
-        // than the master key. The server also restricts sharing to owners and
-        // admins, so this is mostly belt and braces.
-        return Err(anyhow!(
-            "{}/{} was shared with you rather than created by you, and re-sharing \n\
-             is not supported. Ask the owner to share it directly.",
-            vault.name,
-            vault.environment
-        ));
-    }
-
-    let wrapped_for_me =
-        evnx_crypto::b64_decode(&my_key.encrypted_vault_key, "encrypted_vault_key")
-            .map_err(|e| anyhow!("the server sent an unusable wrapped key: {e}"))?;
-    let vault_key =
-        unwrap_vault_key_with_master_key(&wrapped_for_me, &master_key).map_err(|_| {
-            anyhow!(
-                "could not open the key for {}/{} — the master password is probably wrong.",
-                vault.name,
-                vault.environment
-            )
-        })?;
+    // Your own copy, or — for an admin — the one shared to you, opened with the
+    // keypair `unlock` holds (I-311): one opener for push, pull and share.
+    let vault_ref = VaultRef {
+        id: vault.id.clone(),
+        name: vault.name.clone(),
+        environment: vault.environment.clone(),
+    };
+    let vault_key = super::sync::unwrap_vault_key(&client, &vault_ref, &unlocked)?;
 
     let wrapped = wrap_vault_key_for_user(&vault_key, &recipient)
         .map_err(|e| anyhow!("wrapping the vault key for {recipient_email}: {e}"))?;
@@ -499,7 +581,7 @@ pub fn share(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!(
+    crate::say!(
         "  {} shared {}/{} with {recipient_email} as {role}",
         "✓".green(),
         vault.name,
@@ -513,8 +595,8 @@ pub fn share(
             wrapped.mlkem_ciphertext_base64().len()
         );
     }
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  They can pull it with:  {}",
         format!(
             "evnx cloud pull --vault {}/{}",
@@ -537,6 +619,88 @@ struct MyWrappedKey {
     eph_pub_key: Option<String>,
     #[serde(default)]
     mlkem_ciphertext: Option<String>,
+}
+
+/// Leave a vault: delete your own membership (I-312, DEC-VL6).
+///
+/// The server has always allowed it — "leaving on your own account" — and
+/// `vault revoke --user <yourself>` told people to ask an admin instead.
+pub fn leave(
+    server_override: Option<&str>,
+    target: String,
+    yes: bool,
+    verbose: bool,
+) -> Result<()> {
+    let server = CloudConfig::resolve_server(server_override)?;
+    let client = Client::new(server.clone())?;
+    client.require_user_session(
+        "leave a vault",
+        "\x20 Membership is changed by a signed-in person; a leaked CI token must\n\x20 not be able to remove anyone, its owner included.\n",
+    )?;
+
+    let vault = list_and_pick(&client, &target)?;
+    let label = format!("{}/{}", vault.name, vault.environment);
+    let people: MemberList = client
+        .get(&api_path(&["vaults", &vault.id, "members"])?)
+        .map_err(|e| anyhow!("{e}"))?;
+    let me = people
+        .members
+        .iter()
+        .find(|m| m.is_you)
+        .ok_or_else(|| anyhow!("you are not a member of {label}."))?;
+
+    // A vault with no owner has nobody who can delete it; the server refuses.
+    if me.role == "owner" {
+        return Err(anyhow!(
+            "you own {label}, and the owner cannot leave it.\n\
+             \x20 To be rid of it, delete it:  evnx vault delete {target}"
+        ));
+    }
+
+    if !yes {
+        println!("  About to leave {} ({}).", label.bold(), me.role);
+        println!(
+            "  {}",
+            "Your copy of its key is deleted from the server. The vault key is not \
+             rotated."
+                .dimmed()
+        );
+    }
+    if !crate::utils::prompt::confirm(
+        &format!("Leave {label}?"),
+        yes,
+        &format!("evnx vault leave {target} --yes"),
+    )? {
+        println!("  Cancelled; nothing was changed.");
+        return Ok(());
+    }
+
+    client
+        .delete(&api_path(&["vaults", &vault.id, "members", &me.user_id])?)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    crate::say!("  {} left {label}", "✓".green());
+    crate::say!(
+        "  {}",
+        format!(
+            "Anything you pulled is still on this machine. The vault key was not rotated: \
+             someone who stays can run `evnx vault rekey {label}`."
+        )
+        .dimmed()
+    );
+    if verbose {
+        println!("  vault id  {}", vault.id);
+    }
+    Ok(())
+}
+
+/// "a" or "an" before a role: an admin, a developer.
+fn article(role: &str) -> &'static str {
+    if role.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    }
 }
 
 /// Find the vault a user meant.
@@ -581,9 +745,20 @@ fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         return Err(anyhow!("a vault name must be 1–64 characters"));
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    // The server's rule, `^[a-z0-9-]+$` (I-315, DEC-VL8): upper case passed here
+    // and came back as "name: name: only alphanumeric and hyphens".
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        let suggestion: String = name
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
         return Err(anyhow!(
-            "a vault name may contain only letters, digits and hyphens (got {name:?})"
+            "a vault name may contain only lower-case letters, digits and hyphens \
+             (got {name:?}; {suggestion:?} would do)"
         ));
     }
     Ok(())
@@ -624,10 +799,14 @@ mod tests {
             "under_score",
             "dot.dot",
             "UPPER OK but space",
+            // The server's rule is lower case (I-315); this list accepted
+            // "A-B-9", which the server then refused.
+            "A-B-9",
+            "MyApp",
         ] {
             assert!(validate_name(bad).is_err(), "{bad:?} should be rejected");
         }
-        for good in ["api-keys", "v1", "A-B-9"] {
+        for good in ["api-keys", "v1", "a-b-9"] {
             assert!(validate_name(good).is_ok(), "{good:?} should be accepted");
         }
         assert!(validate_name(&"a".repeat(65)).is_err());
@@ -851,19 +1030,20 @@ pub fn members(server_override: Option<&str>, target: String, verbose: bool) -> 
     let client = Client::new(server.clone())?;
     client.require_credential()?;
 
-    let listed: VaultList = client.get("/api/v1/vaults").map_err(|e| anyhow!("{e}"))?;
-    let vault = resolve(&listed.vaults, &target)?;
+    // An id needs no lookup (I-309): a vault-scoped token may read this vault's
+    // members but is refused the list of vaults, so listing first failed it.
+    let vault = fetch_and_resolve(&client, &target)?;
 
     let people: MemberList = client
-        .get(&api_path(&["vaults", &vault.id.to_string(), "members"])?)
+        .get(&api_path(&["vaults", &vault.id, "members"])?)
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!(
-        "  {}/{} — {} member(s)",
-        vault.name.bold(),
-        vault.environment,
-        people.members.len()
-    );
+    let label = if vault.name.is_empty() {
+        vault.id.bold().to_string()
+    } else {
+        format!("{}/{}", vault.name.bold(), vault.environment)
+    };
+    println!("  {label} — {} member(s)", people.members.len());
     println!();
 
     for m in &people.members {
@@ -903,15 +1083,7 @@ pub fn set_role(
     role: String,
     verbose: bool,
 ) -> Result<()> {
-    let role = role.trim().to_lowercase(); // I-223
-    let valid = ["viewer", "developer", "admin"];
-    if !valid.contains(&role.as_str()) {
-        return Err(anyhow!(
-            "role must be one of: {}. Got `{role}`.\n\
-             \x20 `owner` is not assignable — it is set once, by whoever created the vault.",
-            valid.join(", ")
-        ));
-    }
+    let role = parse_role(&role, VAULT_ROLES, VAULT_OWNER)?; // I-223, A-303
     let user_email = user_email.trim().to_lowercase();
 
     let server = CloudConfig::resolve_server(server_override)?;
@@ -921,8 +1093,7 @@ pub fn set_role(
         "\x20 Roles decide who can push, share and revoke; a leaked CI token must\n\x20 not be able to promote anyone.\n",
     )?;
 
-    let listed: VaultList = client.get("/api/v1/vaults").map_err(|e| anyhow!("{e}"))?;
-    let vault = resolve(&listed.vaults, &target)?;
+    let vault = list_and_pick(&client, &target)?;
 
     let people: MemberList = client
         .get(&api_path(&["vaults", &vault.id.to_string(), "members"])?)
@@ -942,9 +1113,10 @@ pub fn set_role(
         })?;
 
     if member.role == role {
-        println!(
+        crate::say!(
             "  {user_email} is already {role} on {}/{}.",
-            vault.name, vault.environment
+            vault.name,
+            vault.environment
         );
         return Ok(());
     }
@@ -961,7 +1133,7 @@ pub fn set_role(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!(
+    crate::say!(
         "  {} {user_email} is now {role} on {}/{}",
         "✓".green(),
         vault.name,
@@ -1066,8 +1238,7 @@ pub fn revoke(
         "\x20 Revoking re-keys the vault for everyone left; a leaked CI token must\n\x20 not be able to remove members or lock them out.\n",
     )?;
 
-    let listed: VaultList = client.get("/api/v1/vaults").map_err(|e| anyhow!("{e}"))?;
-    let vault = resolve(&listed.vaults, &target)?;
+    let vault = list_and_pick(&client, &target)?;
     let label = format!("{}/{}", vault.name, vault.environment);
 
     let people: MemberList = client
@@ -1085,11 +1256,26 @@ pub fn revoke(
             )
         })?;
 
+    // Yourself (I-318): it said "ask an admin to remove you" — to the owner too,
+    // whom nobody can remove, and with `--no-rekey`, where re-keying is moot.
     if leaving.is_you {
+        if leaving.role == "owner" {
+            return Err(anyhow!(
+                "you own {label}, and the owner cannot be removed.\n\
+                 \x20 To be rid of it, delete it:  evnx vault delete {target}"
+            ));
+        }
         return Err(anyhow!(
-            "to leave {label} yourself, ask an admin to remove you.\n\
-             \x20 Revoking your own access would mean re-keying a vault you can no \n\
-             \x20 longer open, which cannot work."
+            "to leave {label} yourself:  evnx vault leave {target}"
+        ));
+    }
+
+    // ⚠️ Before the post-quantum check, the password and the re-encryption
+    // (I-317): the server refuses to remove the owner, and finding that out at
+    // the swap left every staged blob behind in object storage.
+    if leaving.role == "owner" {
+        return Err(anyhow!(
+            "{user_email} owns {label}, and the owner cannot be removed."
         ));
     }
 
@@ -1147,11 +1333,11 @@ pub fn revoke(
             );
             println!("  {}", "secrets at their source.".yellow());
         }
-        let ok = crate::utils::prompt::yes_no()
-            .with_prompt(format!("Remove {user_email} from {label}?"))
-            .default(false)
-            .interact()
-            .context("reading the confirmation")?;
+        let ok = crate::utils::prompt::confirm(
+            &format!("Remove {user_email} from {label}?"),
+            false,
+            &format!("evnx vault revoke {target} --user {user_email} --yes"),
+        )?;
         if !ok {
             println!("  Cancelled; nothing was changed.");
             return Ok(());
@@ -1168,7 +1354,7 @@ pub fn revoke(
                 &leaving.user_id.to_string(),
             ])?)
             .map_err(|e| anyhow!("{e}"))?;
-        println!("  {} removed {user_email} from {label}", "✓".green());
+        crate::say!("  {} removed {user_email} from {label}", "✓".green());
         println!(
             "  {}",
             "The vault key was NOT rotated. Rotate the secrets themselves.".yellow()
@@ -1184,29 +1370,29 @@ pub fn revoke(
     // that swaps the key, so there is no window where they are still a member of a
     // vault whose key has already moved, nor one where they are gone but it has not.
     let password = auth::read_password(password_stdin, "Master password")?;
-    let master_key = auth::derive_master_key_for_account(&client, &password)?;
+    let unlocked = auth::unlock(&client, &password)?;
 
     let total = rotate_vault_key(
         &client,
-        vault,
+        &vault,
         &label,
-        &master_key,
+        &unlocked,
         &remaining,
         Some(&leaving.user_id),
         verbose,
     )?;
 
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {} removed {user_email} from {label} and rotated the vault key",
         "✓".green()
     );
-    println!(
+    crate::say!(
         "  {total} version(s) re-encrypted, {} member(s) re-wrapped",
         remaining.len()
     );
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {}",
         "They can no longer read anything pushed from now on.".dimmed()
     );
@@ -1279,8 +1465,7 @@ pub fn rekey(
         "\x20 A re-key the server cannot check can lock every member out for good;\n\x20 it takes a signed-in member.\n",
     )?;
 
-    let listed: VaultList = client.get("/api/v1/vaults").map_err(|e| anyhow!("{e}"))?;
-    let vault = resolve(&listed.vaults, &target)?;
+    let vault = list_and_pick(&client, &target)?;
     let label = format!("{}/{}", vault.name, vault.environment);
 
     let people: MemberList = client
@@ -1341,11 +1526,11 @@ pub fn rekey(
             "  {}",
             "already read — rotate those secrets at their source.".yellow()
         );
-        let ok = crate::utils::prompt::yes_no()
-            .with_prompt(format!("Rotate the key for {label}?"))
-            .default(false)
-            .interact()
-            .context("reading the confirmation")?;
+        let ok = crate::utils::prompt::confirm(
+            &format!("Rotate the key for {label}?"),
+            false,
+            &format!("evnx vault rekey {target} --yes"),
+        )?;
         if !ok {
             println!("  Cancelled; nothing was changed.");
             return Ok(());
@@ -1353,34 +1538,26 @@ pub fn rekey(
     }
 
     let password = auth::read_password(password_stdin, "Master password")?;
-    let master_key = auth::derive_master_key_for_account(&client, &password)?;
+    let unlocked = auth::unlock(&client, &password)?;
 
     // `None` — nobody is being removed, which is the whole difference from
     // `revoke`. The field is omitted from the request entirely, and the server
     // treats an absent `remove_user_id` as a pure rotation.
-    let total = rotate_vault_key(
-        &client,
-        vault,
-        &label,
-        &master_key,
-        &everyone,
-        None,
-        verbose,
-    )?;
+    let total = rotate_vault_key(&client, &vault, &label, &unlocked, &everyone, None, verbose)?;
 
-    println!();
-    println!("  {} rotated the key for {label}", "\u{2713}".green());
-    println!(
+    crate::say!();
+    crate::say!("  {} rotated the key for {label}", "\u{2713}".green());
+    crate::say!(
         "  {total} version(s) re-encrypted, {} member(s) re-wrapped",
         everyone.len()
     );
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {}",
         "Members keep access and stay signed in — they pick up the new key".dimmed()
     );
-    println!("  {}", "on their next command.".dimmed());
-    println!();
+    crate::say!("  {}", "on their next command.".dimmed());
+    crate::say!();
     println!(
         "  {}",
         "Anyone who could already read a version may still hold a copy —".yellow()
@@ -1436,7 +1613,7 @@ fn rotate_vault_key(
     client: &Client,
     vault: &VaultSummary,
     label: &str,
-    master_key: &evnx_crypto::MasterKey,
+    unlocked: &auth::Unlocked,
     wrap_for: &[&MemberSummary],
     remove_user_id: Option<&str>,
     verbose: bool,
@@ -1456,19 +1633,13 @@ fn rotate_vault_key(
             let wrapped =
                 evnx_crypto::b64_decode(&my_key.encrypted_vault_key, "encrypted_vault_key")
                     .map_err(|e| anyhow!("the server sent an unusable wrapped key: {e}"))?;
-            unwrap_vault_key_with_master_key(&wrapped, master_key)
-                .map_err(|_| anyhow!("could not open your key for {label} — wrong password?"))?
+            unwrap_vault_key_with_master_key(&wrapped, &unlocked.master_key)
+                .map_err(|_| auth::own_copy_will_not_open(label))?
         }
         (Some(eph), Some(ct)) => {
-            let sealed = evnx_crypto::EncryptedPrivateKey::from_base64(&fetch_sealed_private_key(
-                client,
-            )?)
-            .map_err(|e| anyhow!("the server sent an unusable encrypted_private_key: {e}"))?;
-            let keypair = evnx_crypto::decrypt_private_key(&sealed, master_key)
-                .map_err(|_| anyhow!("could not open your keypair — wrong password?"))?;
             let wrapped = WrappedVaultKey::from_base64(&my_key.encrypted_vault_key, eph, ct)
                 .map_err(|e| anyhow!("the server sent an unusable wrapped key: {e}"))?;
-            unwrap_vault_key(&wrapped, &keypair)
+            unwrap_vault_key(&wrapped, &unlocked.keypair)
                 .map_err(|_| anyhow!("could not open your key for {label}."))?
         }
         _ => {
@@ -1487,7 +1658,7 @@ fn rotate_vault_key(
         .map_err(|e| anyhow!("{e}"))?;
 
     let total = versions.versions.len();
-    println!("  Re-encrypting {total} version(s)…");
+    crate::say!("  Re-encrypting {total} version(s)…");
 
     let mut staged = Vec::with_capacity(total);
     for (i, v) in versions.versions.iter().enumerate() {
@@ -1541,19 +1712,19 @@ fn rotate_vault_key(
         });
 
         if verbose {
-            println!("    version {n} re-encrypted ({}/{})", i + 1, total);
+            crate::say!("    version {n} re-encrypted ({}/{})", i + 1, total);
         }
     }
 
     // ── Re-wrap for everyone who stays ───────────────────────────────────────
-    println!("  Re-wrapping for {} member(s)…", wrap_for.len());
+    crate::say!("  Re-wrapping for {} member(s)…", wrap_for.len());
 
     let mut wraps = Vec::with_capacity(wrap_for.len());
     for m in wrap_for {
         if m.is_you {
             // Our own copy stays sealed under the master key: symmetric, no key
             // agreement, and the shape a vault creator's copy has always had.
-            let wrapped = wrap_vault_key_with_master_key(&new_key, master_key)
+            let wrapped = wrap_vault_key_with_master_key(&new_key, &unlocked.master_key)
                 .map_err(|e| anyhow!("wrapping the new key for yourself: {e}"))?;
             wraps.push(RekeyedMember {
                 user_id: m.user_id.clone(),
@@ -1597,16 +1768,4 @@ fn rotate_vault_key(
         .map_err(|e| anyhow!("{e}"))?;
 
     Ok(total)
-}
-
-/// The account's sealed Ed25519 seed, for opening a shared vault key.
-fn fetch_sealed_private_key(client: &Client) -> Result<String> {
-    #[derive(Deserialize)]
-    struct MeSeed {
-        encrypted_private_key: String,
-    }
-    let me: MeSeed = client
-        .get("/api/v1/auth/me")
-        .map_err(|e| anyhow!("fetching your sealed keypair: {e}"))?;
-    Ok(me.encrypted_private_key)
 }

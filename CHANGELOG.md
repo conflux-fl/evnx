@@ -8,6 +8,122 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **A role is read the same way by `vault` and `org`** (A-303, DEC-VL10).
+  `vault share`, `vault role`, `org invite` and `org role` had three copies of
+  the rule: `org` did not trim spaces, `vault share --role owner` was refused
+  without saying why, and each worded the refusal its own way. One parser now:
+  spaces trimmed, any case, `owner` refused with the reason ("A vault has one
+  owner, set once by whoever created it." / the organisation's), anything else
+  as "role must be one of: … Got `x`.". Only the refusals' wording changed;
+  every role accepted before is accepted now.
+- **`evnx vault members <id>` works with a vault-scoped API token** (I-309,
+  A-301). It listed every vault before asking for the members, and such a token
+  is refused the list by design, so it failed with a bare "Insufficient
+  permissions". An id now needs no lookup, as in `cloud pull`; by name, the
+  token is told to pass the id. A vault named by id is shown by its id in the
+  header, with a token or a login. The vault commands now find a vault one way
+  (`list_and_pick`), where six of them had their own copy.
+- 🔒 **`evnx vault share` no longer rewrites an existing member** (I-313,
+  I-314). Sharing with someone already in the vault replaced their role and
+  their key and printed "shared": with your own address an owner became a
+  developer and could no longer delete the vault, and an admin could demote the
+  owner on the way to removing them. `share` now reads the member list first,
+  before the key lookup and the password: yourself and the owner are refused;
+  someone at another role is pointed at `evnx vault role` with the arguments
+  that would do it; someone already at the role asked for gets "already … —
+  nothing changed." and exit 0, as `vault role` does. evnx-server refuses the
+  same requests with a 409 since SV-3, for older CLIs and the app.
+- **The master password is checked before it is used** (I-316, A-302). Every
+  command that asks for it (`vault create`, `share`, `revoke`, `rekey`,
+  `cloud push`, `pull`, `run`, `export`) derived a key from whatever was typed
+  and found out later, at a vault key, saying the password was "probably
+  wrong". `vault create` opens no vault key, so it sealed a new vault under the
+  typo: created, counted against the plan, never openable with the real
+  password. Now the password opens your account's sealed keypair first, and a
+  wrong one is refused right after the prompt with the sentence
+  `rotate-master-password` already used ("that master password did not open
+  your keypair … Nothing has been changed."). A vault whose own copy still will
+  not open with a proven password was created with a typo; the message says so
+  and how to get out of it. Opening a vault shared with you no longer fetches
+  and opens your keypair a second time.
+
+  ⚠️ **If you created a vault with a mistyped password and pushed to it with
+  that same typo**, this release refuses the typo at the check. evnx 0.10.17
+  still opens it with the typo: export its versions with 0.10.17, then delete
+  the vault and create it again.
+- **Admins can share from the CLI** (I-311, DEC-VL5). An admin holds a copy
+  shared to them, and `vault share` refused it ("re-sharing is not supported")
+  after the password, though the server allows admins to share. It is opened
+  with your keypair, as `vault rekey` already did. A developer or viewer is told
+  that sharing needs admin or owner, and an admin asking for `--role admin` that
+  only the owner can make an admin — both before the password.
+- **`evnx vault leave <vault>`** (I-312, I-318, DEC-VL6). A member could not
+  leave a vault from the CLI, though the server allows it; `vault revoke --user
+  <yourself>` said "ask an admin to remove you" — to the owner too. `leave`
+  confirms (`-y` without a terminal), deletes your membership and says the key
+  was not rotated. The owner cannot leave; revoking yourself points at `leave`,
+  or tells the owner why not.
+- **Revoking the owner is refused before any work** (I-317). An admin revoking
+  the owner re-encrypted every version and only then heard the server refuse,
+  leaving the staged blobs in storage.
+- **A vault name is lower-case letters, digits and hyphens, checked before the
+  password** (I-315, DEC-VL8). Upper case passed the CLI and came back from the
+  server as "name: name: only alphanumeric and hyphens". The refusal suggests
+  the lower-case name.
+- **`--version` is 1 or more** for `cloud pull`, `run` and `delete-version`, and
+  a version that does not exist is named, with `evnx cloud history` to look
+  (I-303, DEC-CL11). `--version 0` went to the server and came back as a raw API
+  path.
+- **`cloud history` names who pushed by email** (I-319); it showed an
+  8-character id for everyone but you. Someone who has left keeps the short id.
+- **The push hints name the vault** (I-320). `vault create`, `history`, `diff`,
+  `pull`, `run` and `export` said "Push one with `evnx cloud push`", which fails
+  where no directory is bound; they say `evnx cloud push --vault <vault>`. By
+  name, a vault-scoped token is told to pass the vault's id without naming
+  `--vault`, which `vault members` does not take.
+- **Every cloud confirmation names `--yes` when there is no terminal** (I-218).
+  `vault delete`, `revoke` and `rekey`, `cloud delete-version`, `auth sessions
+  revoke` and `revoke-others`, `auth token revoke` and
+  `rotate-master-password` failed with "IO error: not a terminal: not a
+  terminal"; `cloud pull` over a different file names `--force`. Nothing was or
+  is sent before the answer.
+- **`-q` for every cloud command** (I-225, DEC-CL3, A-44). It reached only the
+  config banner and `cloud status`/`unlink`. Now `auth`, `org`, `vault`,
+  `cloud`, `auth token`, `sessions`, `devices`, `totp` and
+  `rotate-master-password` print nothing on success under `-q`; tables, a new
+  token (alone on stdout), recovery codes, warnings and errors still print. A
+  `crate::say!` macro is the shared output handle.
+- **`cloud watch` reports failed polls and skips your own pushes** (I-229,
+  DEC-CL5). Failures showed only with `-v`, so an expired login looked like a
+  quiet vault. From the third failed poll in a row it says so on stderr, after
+  ten it stops with exit 2, and it says when polling works again. Your own
+  pushes are skipped unless `--include-mine`.
+- **`cloud pull` keeps the file it writes out of git** (owner, 2026-10-17): the
+  `.gitignore` step `template`, `convert` and `restore` use, with `--gitignore`
+  and `--no-gitignore`. `--file -` writes no file and checks nothing.
+- **Pushing the default `.env` into a production vault asks first** (I-234,
+  DEC-CL9). A forgotten `--file` pushed development secrets into production with
+  only a warning. On a terminal it asks; without one it is refused unless
+  `--yes` (`-y`, new on `push`). A file named with `--file` or `--env-name` is
+  not asked about. By id, a signed-in session looks the environment up for the
+  question; a vault-scoped token cannot and is not asked.
+- **README: the whole of `vault`, `cloud` and `org`** (D-155 … D-158, D-301,
+  D-302, DEC-VL9): the role table, `rekey`, `--no-rekey`, `leave`,
+  `delete-version`, `unlink`, every `org` command, which file push and pull use,
+  what works by id with a vault-scoped token, and `cloud export --output` (it
+  said `--out`). A test checks the commands against the CLI both ways.
+- `org` subcommands' `--org <slug>` have help text (DEC-SF12).
+
+⚠️ **Scripts:**
+- `cloud push` of the default `.env` into a production vault with no terminal
+  now exits 2 unless `--yes` (or `--file`/`--env-name`).
+- Under `-q`, cloud commands print far less: a script that read a status line
+  ("✓ pushed …") from stdout under `-q` gets nothing.
+- `vault create` with upper case exits 2 before the password prompt.
+- `cloud history`'s `PUSHED BY` holds emails, and its width follows them.
+- `cloud pull` into a git repository may print a `.gitignore` question or
+  warning; `--no-gitignore` skips it.
+
 ## [0.10.17] - 2026-10-23
 
 The patch for `evnx auth` (package R-auth, #221). `evnx auth status` says why a

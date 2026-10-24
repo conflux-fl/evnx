@@ -107,7 +107,8 @@ pub fn export(
     let mut versions = sync::list_versions(&client, &vault_ref)?;
     if versions.is_empty() {
         return Err(anyhow!(
-            "{} has no versions to export. Push one with `evnx cloud push`.",
+            "{} has no versions to export. Push one with `evnx cloud push --vault {}`.",
+            vault_ref.label(),
             vault_ref.label()
         ));
     }
@@ -127,30 +128,30 @@ pub fn export(
             .collect()
     };
 
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  exporting {} version(s) of {} to {}",
         wanted.len().to_string().bold(),
         vault_ref.label().bold(),
         dir.display().to_string().bold()
     );
     if !all_versions && versions.len() > 1 {
-        println!(
+        crate::say!(
             "  {} is the latest of {}. Pass {} for all of them.",
             format!("v{latest}").dimmed(),
             versions.len(),
             "--all-versions".cyan()
         );
     }
-    println!();
+    crate::say!();
 
     let password = auth::read_password(password_stdin, "Master password")?;
-    let master_key = auth::derive_master_key_for_account(&client, &password)?;
+    let unlocked = auth::unlock(&client, &password)?;
 
     // Opened **once** and reused for every version. The key is per vault, not
     // per version, so unwrapping it in the loop would be one needless round trip
     // per version and would make a 40-version export forty times as chatty.
-    let vault_key = sync::unwrap_vault_key(&client, &vault_ref, &master_key)?;
+    let vault_key = sync::unwrap_vault_key(&client, &vault_ref, &unlocked)?;
 
     create_dir_private(&dir)?;
     // Everything in an export is plaintext: ignore all of it, wherever it lands
@@ -203,7 +204,7 @@ pub fn export(
         super::creds::write_atomic_secure(&path, &bytes)
             .with_context(|| format!("writing {}", path.display()))?;
 
-        println!(
+        crate::say!(
             "  {} {}  {} variable(s), {} bytes",
             "✓".green(),
             name.bold(),
@@ -222,9 +223,9 @@ pub fn export(
             .as_bytes(),
     )
     .with_context(|| format!("writing {}", manifest_path.display()))?;
-    println!("  {} manifest.json", "✓".green());
+    crate::say!("  {} manifest.json", "✓".green());
 
-    println!();
+    crate::say!();
     println!(
         "  {}",
         "⚠ These files hold your secrets in plain text."
@@ -243,12 +244,12 @@ pub fn export(
         "  {}",
         "  other users on this machine — not from backup, sync or a commit.".yellow()
     );
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {}",
         "It is a copy taken now. It does not stay in sync, and a stale export of".dimmed()
     );
-    println!(
+    crate::say!(
         "  {}",
         "rotated credentials is its own hazard. For CI, use `evnx cloud run`.".dimmed()
     );
@@ -258,7 +259,7 @@ pub fn export(
         println!("  vault:   {}", vault_ref.id);
         println!("  format:  {}", to.as_deref().unwrap_or("env (verbatim)"));
     }
-    println!();
+    crate::say!();
     Ok(())
 }
 

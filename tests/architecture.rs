@@ -345,3 +345,78 @@ fn t_i265_one_yes_no_prompt() {
         "yes/no prompts outside utils::prompt::yes_no: {offenders:?}"
     );
 }
+
+/// A vault target is turned into a vault in one place (A-301, DEC-VL10). Six
+/// commands listed the vaults and picked one themselves, so `vault members` by
+/// id with a vault-scoped token failed at a list call `cloud pull` had long
+/// stopped making (I-309), and a refused list was reported bare.
+///
+/// Counted in `vault.rs`, where `resolve` lives: a call of `resolve` itself (not
+/// `fetch_and_resolve`) that picks from a list by the user's `target`. Its unit
+/// tests call it with literals, and `token.rs` and `session.rs` have resolvers of
+/// their own for other things.
+#[test]
+fn t_a301_a_vault_target_is_resolved_in_one_place() {
+    let path = src().join("cloud").join("vault.rs");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let calls_resolve = |l: &str| {
+        l.match_indices("resolve(&").any(|(i, _)| {
+            !l[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    };
+    let sites: Vec<usize> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            !l.trim_start().starts_with("//") && calls_resolve(l) && l.contains("target)")
+        })
+        .map(|(n, _)| n + 1)
+        .collect();
+    assert_eq!(
+        sites.len(),
+        1,
+        "vault.rs resolves a target at lines {sites:?}"
+    );
+}
+
+/// The master password is proven in one place (A-302, I-316, DEC-VL7):
+/// `auth::unlock` derives the key and opens the account's sealed keypair with
+/// it, so a wrong password is caught before anything uses the key.
+/// `derive_master_key_for_account` derived without checking, and three more
+/// copies opened the keypair on their own, each with its own message.
+///
+/// Allowed elsewhere: `auth.rs` itself (register, unlock, the login backfill)
+/// and `rotate.rs`, which derives the *new* key and re-opens what it sealed —
+/// but proves the *current* password through `auth::unlock_with`.
+#[test]
+fn t_a302_the_master_password_is_proven_in_one_place() {
+    let mut files = Vec::new();
+    rust_files(&src().join("cloud"), &mut files);
+    let mut offenders = Vec::new();
+    for f in &files {
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(f).unwrap();
+        if text.contains("fn derive_master_key_for_account") {
+            offenders.push(format!("{name}: fn derive_master_key_for_account"));
+        }
+        if name == "rotate.rs" && !text.contains("auth::unlock_with(") {
+            offenders.push("rotate.rs: does not use auth::unlock_with".into());
+        }
+        if name == "auth.rs" || name == "rotate.rs" {
+            continue;
+        }
+        for (n, l) in text.lines().enumerate() {
+            let code = !l.trim_start().starts_with("//");
+            if code && (l.contains("derive_master_key(") || l.contains("decrypt_private_key(")) {
+                offenders.push(format!("{name}:{}", n + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the master key outside auth::unlock: {offenders:?}"
+    );
+}

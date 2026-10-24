@@ -107,8 +107,8 @@ fn register_with_password(
     validate_email(email)?;
     check_password_strength(password)?;
 
-    println!();
-    println!("  Deriving keys on this machine…");
+    crate::say!();
+    crate::say!("  Deriving keys on this machine…");
     if verbose {
         println!("  (Argon2id, 64 MiB, t=3, p=4 — twice, with separate salts)");
     }
@@ -120,17 +120,17 @@ fn register_with_password(
         .post_public("/api/v1/auth/register", &body)
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!("  {} account created on {server}", "✓".green());
+    crate::say!("  {} account created on {server}", "✓".green());
     if verbose {
         println!("  user id   {}", resp.user_id);
     }
-    println!();
-    println!("  {} check your inbox", "Next:".bold());
-    println!("  A verification link was sent to {email}.");
-    println!("  Vault commands stay unavailable until you open it.");
-    println!();
-    println!("  Then sign in with:  {}", "evnx auth login".cyan());
-    println!();
+    crate::say!();
+    crate::say!("  {} check your inbox", "Next:".bold());
+    crate::say!("  A verification link was sent to {email}.");
+    crate::say!("  Vault commands stay unavailable until you open it.");
+    crate::say!();
+    crate::say!("  Then sign in with:  {}", "evnx auth login".cyan());
+    crate::say!();
     println!(
         "  {} your master password is the only thing that can open your vaults.",
         "Remember:".yellow().bold()
@@ -338,7 +338,7 @@ fn login_with_password(
     if verbose {
         println!("  srp session {}", init.session_id);
     }
-    println!("  Deriving your key on this machine…");
+    crate::say!("  Deriving your key on this machine…");
 
     // ── Step 2: prove we know the password ───────────────────────────────────
     let srp_salt = salt_from_base64(&init.srp_salt)
@@ -432,7 +432,7 @@ fn login_with_password(
         backfill_mlkem_key(&authed, password, verbose);
     }
 
-    println!("  {} signed in as {email}", "✓".green());
+    crate::say!("  {} signed in as {email}", "✓".green());
     if let Some(n) = remaining {
         // Warn while there is still time to act. Running out means the next lost
         // phone is a permanently locked account.
@@ -472,7 +472,7 @@ pub fn logout(server_override: Option<&str>, verbose: bool) -> Result<()> {
             );
             println!("  from a signed-in machine with `evnx auth token revoke <name>`.");
         } else {
-            println!("  Not signed in to {server}; nothing to do.");
+            crate::say!("  Not signed in to {server}; nothing to do.");
         }
         return Ok(());
     }
@@ -486,9 +486,9 @@ pub fn logout(server_override: Option<&str>, verbose: bool) -> Result<()> {
     store.save()?;
 
     match server_result {
-        Ok(()) => println!("  {} signed out of {server}", "✓".green()),
+        Ok(()) => crate::say!("  {} signed out of {server}", "✓".green()),
         Err(e) => {
-            println!("  {} local credentials removed", "✓".green());
+            crate::say!("  {} local credentials removed", "✓".green());
             println!("  {} the server was not told: {e}", "warning:".yellow());
             println!("  The session may still be usable until it expires. Revoke it from");
             println!("  another signed-in machine with `evnx auth sessions list`.");
@@ -770,27 +770,84 @@ pub(crate) fn read_password(from_stdin: bool, prompt: &str) -> Result<Zeroizing<
     }
 }
 
-/// Derive this account's master key.
+/// The master key, with the password behind it proven (A-302, I-316).
+pub(crate) struct Unlocked {
+    pub master_key: evnx_crypto::MasterKey,
+    /// The account keypair, opened with the master key. Opening it is the
+    /// proof; it also opens a vault key shared with you, whose hybrid wrap
+    /// needs the keypair rather than the master key.
+    pub keypair: evnx_crypto::UserKeypair,
+}
+
+/// What every command says when the master password is not this account's.
+///
+/// `rotate-master-password`'s sentence, which it said before any other command
+/// checked the password at all.
+const WRONG_PASSWORD: &str =
+    "that master password did not open your keypair, so it is not the one \
+     this account was registered with. Nothing has been changed.\n\
+     \x20 If you have already changed it on another machine, use the new one.";
+
+#[derive(Deserialize)]
+struct MeSealed {
+    argon2_salt: String,
+    encrypted_private_key: String,
+}
+
+/// Derive this account's master key from `password` and prove it.
+///
+/// ⚠️ Derived and not checked, a wrong password went unnoticed until a vault
+/// key would not open — and `vault create` opens none, so it sealed a new vault
+/// under the typo: created, counted against the plan, and never openable with
+/// the real password (I-316). The account's keypair is sealed under the master
+/// key, so opening it proves the password before anything uses the key.
 ///
 /// The Argon2id salt lives on the server — it is not a secret, and fetching it
 /// means the CLI does not have to cache anything between commands. `/auth/me`
 /// works before the email is verified, which is deliberate on the server side.
-pub(crate) fn derive_master_key_for_account(
-    client: &Client,
-    password: &Zeroizing<String>,
-) -> Result<evnx_crypto::MasterKey> {
-    use evnx_crypto::{derive_master_key, salt_from_base64};
-
-    let me: MeSalt = client.get("/api/v1/auth/me").map_err(|e| anyhow!("{e}"))?;
-    let salt = salt_from_base64(&me.argon2_salt)
-        .map_err(|e| anyhow!("the server sent an unusable argon2_salt: {e}"))?;
-    derive_master_key(password.as_bytes(), &salt)
-        .map_err(|e| anyhow!("deriving the master key: {e}"))
+pub(crate) fn unlock(client: &Client, password: &Zeroizing<String>) -> Result<Unlocked> {
+    let me: MeSealed = client.get("/api/v1/auth/me").map_err(|e| anyhow!("{e}"))?;
+    unlock_with(&me.argon2_salt, &me.encrypted_private_key, password)
 }
 
-#[derive(Deserialize)]
-struct MeSalt {
-    argon2_salt: String,
+/// [`unlock`], for a caller that already holds `/auth/me`'s salt and sealed
+/// keypair (`rotate-master-password`).
+pub(crate) fn unlock_with(
+    argon2_salt: &str,
+    encrypted_private_key: &str,
+    password: &Zeroizing<String>,
+) -> Result<Unlocked> {
+    use evnx_crypto::{
+        decrypt_private_key, derive_master_key, salt_from_base64, EncryptedPrivateKey,
+    };
+
+    let salt = salt_from_base64(argon2_salt)
+        .map_err(|e| anyhow!("the server sent an unusable argon2_salt: {e}"))?;
+    let master_key = derive_master_key(password.as_bytes(), &salt)
+        .map_err(|e| anyhow!("deriving the master key: {e}"))?;
+    let sealed = EncryptedPrivateKey::from_base64(encrypted_private_key)
+        .map_err(|e| anyhow!("the server sent an unusable encrypted_private_key: {e}"))?;
+    let keypair = decrypt_private_key(&sealed, &master_key).map_err(|_| anyhow!(WRONG_PASSWORD))?;
+    Ok(Unlocked {
+        master_key,
+        keypair,
+    })
+}
+
+/// Your own copy of a vault key would not open, with a password [`unlock`] has
+/// proven. So it was sealed under another one: a typo at `vault create`, which
+/// did not check the password before 0.10.18 (I-316, DEC-VL7).
+pub(crate) fn own_copy_will_not_open(label: &str) -> anyhow::Error {
+    anyhow!(
+        "could not open your copy of the key for {label}, though your master password \
+         is right.\n\
+         \x20 It was most likely created with a mistyped password: evnx before 0.10.18 \
+         did not check the password at `vault create`, so the vault is sealed under \
+         the typo.\n\
+         \x20 If nothing was pushed to it, delete it (`evnx vault delete {label}`) and \
+         create it again. If something was, evnx 0.10.17 still opens it with that \
+         same typo."
+    )
 }
 
 /// What the F1 backfill needs from `/auth/me`.
@@ -1136,9 +1193,9 @@ pub fn delete_account(
     store.remove_session(&server);
     store.save()?;
 
-    println!();
-    println!("  {} account deleted", "✓".green());
-    println!(
+    crate::say!();
+    crate::say!("  {} account deleted", "✓".green());
+    crate::say!(
         "  {}",
         "Local credentials removed. Any secrets that were in those vaults should \
          be rotated at their source if anyone else ever held them."
@@ -1234,13 +1291,13 @@ pub fn download_data(
     let tokens = body["api_tokens"].as_array().map_or(0, |v| v.len());
     let events = body["audit_events"].as_array().map_or(0, |v| v.len());
 
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {} wrote {}",
         "✓".green(),
         path.display().to_string().bold()
     );
-    println!("  {vaults} vault(s), {tokens} API token(s), {events} audit event(s)");
+    crate::say!("  {vaults} vault(s), {tokens} API token(s), {events} audit event(s)");
     println!();
     println!(
         "  {}",
@@ -1306,6 +1363,34 @@ mod tests {
 
     fn pw(s: &str) -> Zeroizing<String> {
         Zeroizing::new(s.to_string())
+    }
+
+    /// I-316, A-302: `unlock_with` proves the password by opening the sealed
+    /// keypair. A wrong one gets `rotate-master-password`'s sentence word for
+    /// word — it moved here, and rotate must still say exactly that.
+    #[test]
+    fn t_i316_unlock_proves_the_password() {
+        use evnx_crypto::{
+            derive_master_key, encrypt_private_key, generate_keypair, generate_salt, salt_to_base64,
+        };
+        let salt = generate_salt();
+        let master = derive_master_key(b"the right password", &salt).unwrap();
+        let sealed = encrypt_private_key(&generate_keypair(), &master)
+            .unwrap()
+            .to_base64();
+        let salt = salt_to_base64(&salt);
+
+        assert!(unlock_with(&salt, &sealed, &pw("the right password")).is_ok());
+        let e = unlock_with(&salt, &sealed, &pw("the wrong password"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            e,
+            "that master password did not open your keypair, so it is not the one this \
+             account was registered with. Nothing has been changed.\n  If you have \
+             already changed it on another machine, use the new one."
+        );
     }
 
     #[test]

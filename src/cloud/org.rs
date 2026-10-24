@@ -35,6 +35,7 @@ use serde::Deserialize;
 
 use super::client::Client;
 use super::config::CloudConfig;
+use super::role::{parse_role, ORG_OWNER, ORG_ROLES};
 
 /// The sentence that has to survive every copy edit in this module.
 const NOT_VAULT_ACCESS: &str =
@@ -300,22 +301,6 @@ fn members_of(client: &Client, org_id: &str) -> Result<Vec<MemberSummary>> {
     Ok(listed.members)
 }
 
-/// ⚠️ Refused client-side as well as by the server and by migration 010's CHECK.
-/// Three layers, because an organisation has exactly one owner and an invitation
-/// is a link somebody can forward.
-fn validate_role(raw: &str) -> Result<String> {
-    match raw.to_lowercase().as_str() {
-        "member" => Ok("member".into()),
-        "admin" => Ok("admin".into()),
-        "owner" => Err(anyhow!(
-            "`owner` cannot be granted. An organisation has exactly one owner, set\n\
-             \x20 when it is created — handing it out through an invitation or a role\n\
-             \x20 change would leave two, and nothing could then remove either."
-        )),
-        other => Err(anyhow!("role must be `member` or `admin`, not {other:?}")),
-    }
-}
-
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 /// `evnx org create <name> --slug <slug>`
@@ -339,24 +324,24 @@ pub fn create(server_override: Option<&str>, name: &str, slug: &str, verbose: bo
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!();
-    println!("  {} created {}", "✓".green(), created.slug.bold());
+    crate::say!();
+    crate::say!("  {} created {}", "✓".green(), created.slug.bold());
     if verbose {
         println!("  id  {}", created.id);
     }
-    println!();
+    crate::say!();
     // ⚠️ Said at creation, which is when someone forms a belief about what they
     // just made — and when they are most likely to invite the whole team.
-    println!("  You are the owner, and hold no seat yet.");
-    println!(
+    crate::say!("  You are the owner, and hold no seat yet.");
+    crate::say!(
         "  {}",
         "A new organisation is on the free plan, so a seat would change nothing".dimmed()
     );
-    println!("  {}", "until billing is set up.".dimmed());
-    println!();
-    println!("  {NOT_VAULT_ACCESS}");
-    println!();
-    println!("  Next:  evnx org invite <email>");
+    crate::say!("  {}", "until billing is set up.".dimmed());
+    crate::say!();
+    crate::say!("  {NOT_VAULT_ACCESS}");
+    crate::say!();
+    crate::say!("  Next:  evnx org invite <email>");
     Ok(())
 }
 
@@ -461,7 +446,7 @@ pub fn invite(
     let client = Client::new(server.clone())?;
     require_login(&client, &server)?;
 
-    let role = validate_role(role.unwrap_or("member"))?;
+    let role = parse_role(role.unwrap_or("member"), ORG_ROLES, ORG_OWNER)?; // A-303
     let target = resolve_org(&client, org)?;
 
     let created: CreatedInvite = client
@@ -471,20 +456,20 @@ pub fn invite(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {} invited {} to {} as {}",
         "✓".green(),
         created.email.bold(),
         target.slug,
         created.role
     );
-    println!();
-    println!("  An email is on its way. To pass the invitation on yourself:");
-    println!();
+    crate::say!();
+    crate::say!("  An email is on its way. To pass the invitation on yourself:");
+    crate::say!();
     println!("      evnx org accept {}", created.token);
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {}",
         format!(
             "Expires in {} days, and can be used once.",
@@ -498,11 +483,11 @@ pub fn invite(
             "Only the invited address can redeem it — the token alone is not enough.".dimmed()
         );
     }
-    println!();
+    crate::say!();
     // ⚠️ The most important line in this module. An invitation into something
     // called an organisation reads as an invitation to shared secrets.
     println!("  {}", "They will NOT gain access to any vault.".yellow());
-    println!("  {NOT_VAULT_ACCESS}");
+    crate::say!("  {NOT_VAULT_ACCESS}");
     Ok(())
 }
 
@@ -565,7 +550,7 @@ pub fn uninvite(
         ])?)
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!("  {} withdrew that invitation", "✓".green());
+    crate::say!("  {} withdrew that invitation", "✓".green());
     Ok(())
 }
 
@@ -585,20 +570,20 @@ pub fn accept(server_override: Option<&str>, token: &str, _verbose: bool) -> Res
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!();
-    println!(
+    crate::say!();
+    crate::say!(
         "  {} joined {} as {}",
         "✓".green(),
         joined.organization.bold(),
         joined.role
     );
-    println!();
+    crate::say!();
     // ⚠️ Said because the obvious expectation is wrong in two ways at once: no
     // seat, and no vault.
-    println!("  You hold no seat yet — an administrator assigns one, and that is");
-    println!("  what decides your plan's limits.");
-    println!();
-    println!("  {NOT_VAULT_ACCESS}");
+    crate::say!("  You hold no seat yet — an administrator assigns one, and that is");
+    crate::say!("  what decides your plan's limits.");
+    crate::say!();
+    crate::say!("  {NOT_VAULT_ACCESS}");
     Ok(())
 }
 
@@ -626,8 +611,8 @@ pub fn seats(
                 println!("  {} more seats are assigned than purchased", "!".yellow());
             }
         }
-        println!();
-        println!("  Change it with `evnx org seats --set N` or `--unlimited`.");
+        crate::say!();
+        crate::say!("  Change it with `evnx org seats --set N` or `--unlimited`.");
         return Ok(());
     }
 
@@ -672,9 +657,9 @@ pub fn seats(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!("  {} seats {}", "✓".green(), state.seats.render());
+    crate::say!("  {} seats {}", "✓".green(), state.seats.render());
     if state.over_seated {
-        println!();
+        crate::say!();
         // ⚠️ Reported, not refused — the server allows this deliberately so a
         // billing downgrade can never be rejected by the database. Someone has to
         // be told, though, because the people over the line keep their seats until
@@ -879,38 +864,39 @@ fn seat_change(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!();
+    crate::say!();
     if assign {
-        println!(
+        crate::say!(
             "  {} {} now holds a seat in {}",
             "✓".green(),
             member.email.bold(),
             target.slug
         );
-        println!();
+        crate::say!();
         // ⚠️ A seat IS a plan change, and the person it happened to will see their
         // limits move. Saying so here is what makes that explicable.
-        println!(
+        crate::say!(
             "  Their limits are now {}'s — on the {} plan.",
-            target.slug, target.plan
+            target.slug,
+            target.plan
         );
     } else {
-        println!(
+        crate::say!(
             "  {} released {}'s seat in {}",
             "✓".green(),
             member.email.bold(),
             target.slug
         );
-        println!();
+        crate::say!();
         println!(
             "  {} their limits drop back to their own plan.",
             "!".yellow()
         );
-        println!(
+        crate::say!(
             "  {}",
             "Nothing is deleted. A vault already over the new limit stays readable;".dimmed()
         );
-        println!("  {}", "the next push to it is what gets refused.".dimmed());
+        crate::say!("  {}", "the next push to it is what gets refused.".dimmed());
     }
     if verbose {
         println!("  user id  {}", member.user_id);
@@ -930,7 +916,7 @@ pub fn set_role(
     let client = Client::new(server.clone())?;
     require_login(&client, &server)?;
 
-    let role = validate_role(role)?;
+    let role = parse_role(role, ORG_ROLES, ORG_OWNER)?; // A-303
     let target = resolve_org(&client, org)?;
     let members = members_of(&client, &target.id)?;
     let member = resolve_member(&members, who)?;
@@ -947,7 +933,7 @@ pub fn set_role(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!(
+    crate::say!(
         "  {} {} is now {} in {}",
         "✓".green(),
         member.email.bold(),
@@ -1006,7 +992,7 @@ pub fn remove(
         ])?)
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!("  {} removed {}", "✓".green(), member.email);
+    crate::say!("  {} removed {}", "✓".green(), member.email);
     Ok(())
 }
 
@@ -1072,7 +1058,7 @@ pub fn delete(
         )
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!("  {} deleted {}", "✓".green(), target.slug);
+    crate::say!("  {} deleted {}", "✓".green(), target.slug);
     Ok(())
 }
 
@@ -1132,7 +1118,7 @@ pub fn leave(
         ])?)
         .map_err(|e| anyhow!("{e}"))?;
 
-    println!("  {} left {}", "✓".green(), target.slug);
+    crate::say!("  {} left {}", "✓".green(), target.slug);
     Ok(())
 }
 
@@ -1168,6 +1154,7 @@ mod tests {
     /// ⚠️ `owner` must be refused before the request is made, with a reason.
     #[test]
     fn owner_is_not_a_grantable_role() {
+        let validate_role = |raw| parse_role(raw, ORG_ROLES, ORG_OWNER);
         assert_eq!(validate_role("member").unwrap(), "member");
         assert_eq!(validate_role("ADMIN").unwrap(), "admin");
 
