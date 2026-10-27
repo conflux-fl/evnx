@@ -49,6 +49,28 @@ pub fn resolve(dir: &Path, name: Option<&str>) -> Result<PathBuf> {
         return Ok(in_dir(dir, DEFAULT_FILE));
     };
 
+    let name = checked(name)?;
+    let path = in_dir(dir, &format!(".env.{name}"));
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    bail!("{}", not_found_message(dir, name));
+}
+
+/// The file a command that **writes** should write: `.env`, or `.env.<name>`
+/// for a valid name. Unlike [`resolve`] it does not need the file to exist —
+/// `init` and `add` create it (RM-17).
+pub fn file_name(name: Option<&str>) -> Result<String> {
+    Ok(match name {
+        None => DEFAULT_FILE.to_string(),
+        Some(name) => format!(".env.{}", checked(name)?),
+    })
+}
+
+/// `name`, trimmed, if it is one path segment a person could mean as an
+/// environment.
+fn checked(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() {
         bail!(
@@ -70,13 +92,7 @@ pub fn resolve(dir: &Path, name: Option<&str>) -> Result<PathBuf> {
             SUGGESTED.join(", ")
         );
     }
-
-    let path = in_dir(dir, &format!(".env.{name}"));
-    if path.is_file() {
-        return Ok(path);
-    }
-
-    bail!("{}", not_found_message(dir, name));
+    Ok(name)
 }
 
 /// `file` inside `dir`, written the way a person would type it: in the current
@@ -257,14 +273,22 @@ fn not_found_message(dir: &Path, name: &str) -> String {
 
     let mut msg = format!("{wanted} does not exist");
 
-    // The common typo is an abbreviation of a real name.
-    if let Some(guess) = abbreviation_of(
-        name,
-        present
-            .iter()
-            .map(String::as_str)
-            .chain(SUGGESTED.iter().copied()),
-    ) {
+    // An abbreviation of a real name (`prod`), else the closest spelling
+    // (`prodution`): the one rule the contract's environment check uses too
+    // (RM-17). Files present come first, then the suggested names.
+    // The name itself is no suggestion: `.env.staging` is missing, so
+    // "did you mean 'staging'" would point back at the same file.
+    let mut candidates: Vec<&str> = present
+        .iter()
+        .map(String::as_str)
+        .filter(|c| *c != name)
+        .collect();
+    for s in SUGGESTED {
+        if *s != name && !candidates.contains(s) {
+            candidates.push(s);
+        }
+    }
+    if let Some(guess) = meant(name, &candidates) {
         msg.push_str(&format!(" — did you mean '{guess}'?"));
     }
 
@@ -361,6 +385,35 @@ mod tests {
         let dir = project(&[".env.production"]);
         let err = resolve(dir.path(), Some("prod")).unwrap_err().to_string();
         assert!(err.contains("did you mean 'production'"), "{err}");
+    }
+
+    /// RM-17: the writing side takes the same names, and refuses the same ones.
+    #[test]
+    fn rm17_file_name_validates_without_needing_the_file() {
+        assert_eq!(file_name(None).unwrap(), ".env");
+        assert_eq!(file_name(Some(" staging ")).unwrap(), ".env.staging");
+        assert!(file_name(Some("../x")).is_err());
+        assert!(file_name(Some("")).is_err());
+    }
+
+    /// RM-17: a misspelling gets a suggestion too, not only an abbreviation.
+    #[test]
+    fn rm17_a_misspelt_name_is_matched_by_spelling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".env.production"), "A=1\n").unwrap();
+        let err = resolve(dir.path(), Some("prodution"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did you mean 'production'"), "{err}");
+        let err = resolve(dir.path(), Some("zzzzzzzz"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("did you mean"), "{err}");
+        // A suggested name that is missing is not suggested back to itself.
+        let err = resolve(dir.path(), Some("staging"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("did you mean 'staging'"), "{err}");
     }
 
     #[test]
