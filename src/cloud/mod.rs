@@ -119,6 +119,8 @@ pub fn run(command: CloudCommands, server_override: Option<&str>, verbose: bool)
             exclude,
             password_stdin,
             allow_unsafe_names,
+            mask,
+            no_mask,
             command,
         } => run::run(
             server_override,
@@ -128,6 +130,7 @@ pub fn run(command: CloudCommands, server_override: Option<&str>, verbose: bool)
             exclude,
             password_stdin,
             allow_unsafe_names,
+            crate::core::inject::masking(mask, no_mask),
             verbose,
             command,
         ),
@@ -144,8 +147,28 @@ pub fn run(command: CloudCommands, server_override: Option<&str>, verbose: bool)
             include_mine,
             verbose,
         ),
-        CloudCommands::Diff { vault, from, to } => {
-            sync::diff(server_override, vault, from, to, verbose)
+        CloudCommands::Diff {
+            vault,
+            from,
+            to,
+            local,
+            version,
+            file,
+            env_name,
+            password_stdin,
+        } => {
+            if local {
+                sync::diff_local(
+                    server_override,
+                    vault,
+                    file,
+                    env_name,
+                    version,
+                    password_stdin,
+                )
+            } else {
+                sync::diff(server_override, vault, from, to, verbose)
+            }
         }
         CloudCommands::Audit { vault, last, event } => {
             audit::run(server_override, vault, &last, event, verbose)
@@ -158,7 +181,9 @@ pub fn run(command: CloudCommands, server_override: Option<&str>, verbose: bool)
             vault,
             yes,
         } => sync::delete_version(server_override, vault, version_num, yes, verbose),
-        CloudCommands::Link { vault } => sync::link(server_override, vault, verbose),
+        CloudCommands::Link { vault, file } => {
+            sync::link(server_override, vault, file.as_deref(), verbose)
+        }
         CloudCommands::Unlink => sync::unlink(verbose),
         CloudCommands::Export {
             vault,

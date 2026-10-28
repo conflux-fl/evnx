@@ -1311,6 +1311,19 @@ pub enum CloudCommands {
         #[arg(long)]
         allow_unsafe_names: bool,
 
+        /// Mask secret values in the command's output as `***`.
+        ///
+        /// On by default when output is not a terminal (a CI log, an agent),
+        /// where what is printed is kept. Only values the classifier calls
+        /// secret (by name or by value) are masked. It prevents accidents, not
+        /// exfiltration: a command that transforms a value gets past it.
+        #[arg(long, conflicts_with = "no_mask")]
+        mask: bool,
+
+        /// Never mask the command's output.
+        #[arg(long)]
+        no_mask: bool,
+
         /// The command to run, after `--`.
         ///
         /// `last = true` makes the separator mandatory, so a flag meant for the
@@ -1383,7 +1396,13 @@ pub enum CloudCommands {
     /// that happens the blob hashes are compared and the answer says so, rather
     /// than reporting "no changes".
     ///
-    /// Read-only: one request, no blob download, no password.
+    /// Read-only: one request, no blob download, no password. `--local`
+    /// compares the local file with a version instead, values included; that
+    /// needs the master password and decrypts in memory.
+    ///
+    /// `--version` here means the vault version (with `--local`), so clap's
+    /// auto-generated `--version` is disabled; `evnx --version` still works.
+    #[command(disable_version_flag = true)]
     Diff {
         /// Vault to inspect. Optional in a bound directory.
         #[arg(long, value_name = "VAULT")]
@@ -1396,6 +1415,32 @@ pub enum CloudCommands {
         /// Newer version number. Defaults to the newest.
         #[arg(long, value_name = "N")]
         to: Option<i32>,
+
+        /// Compare the local file with a version instead: key names added,
+        /// removed and changed, never values. Exit 0 when they match, 1 when
+        /// they differ.
+        ///
+        /// Decrypted in memory, so it needs the master password; nothing is
+        /// written. The file is chosen as `cloud pull` chooses it (`--file`,
+        /// `--env-name`, `[cloud] file`, then `.env`).
+        #[arg(long, conflicts_with_all = ["from", "to"])]
+        local: bool,
+
+        /// With --local: the version to compare with. Defaults to the newest.
+        #[arg(long, value_name = "N", requires = "local", value_parser = clap::value_parser!(i32).range(1..))]
+        version: Option<i32>,
+
+        /// With --local: the local file.
+        #[arg(long, short = 'f', value_name = "FILE", requires = "local")]
+        file: Option<std::path::PathBuf>,
+
+        /// With --local: use `.env.<NAME>`.
+        #[arg(long, value_name = "NAME", requires = "local", conflicts_with = "file")]
+        env_name: Option<String>,
+
+        /// With --local: read the master password from stdin.
+        #[arg(long, requires = "local")]
+        password_stdin: bool,
     },
 
     /// Who did what to a vault, newest first.
@@ -1466,6 +1511,14 @@ pub enum CloudCommands {
     Link {
         /// Vault to bind: `name`, `name/environment`, or an id.
         vault: String,
+
+        /// The file push and pull use with this vault, from any folder below
+        /// the binding (`--file deploy/.env`). Stored as `[cloud] file`,
+        /// relative to the folder the `.evnx.toml` is in, so it names the
+        /// same file wherever the command runs. `--file` and `--env-name` on
+        /// push and pull still win.
+        #[arg(long, short = 'f', value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
     },
 
     /// Remove this directory's vault binding.
@@ -2073,9 +2126,10 @@ pub enum Commands {
         /// Print the values, not just which keys differ.
         ///
         /// In `pretty` and `json` a secret stays masked: by its name, or by the
-        /// value itself (`postgres://admin:***@db`). Without this flag `patch`
-        /// and `--interactive` print `<withheld>`; with it they print the exact
-        /// values, so the patch applies.
+        /// value itself (`postgres://admin:***@db`). A `patch` that carries
+        /// real values (`--values`, `--against`, `--reverse`) needs this flag,
+        /// and then has the exact values so it applies; `--interactive` shows
+        /// `<withheld>` in its questions without it.
         ///
         /// ⚠️ With `patch` and `--interactive` this puts real secrets on your
         /// terminal and into its scrollback, and into any CI log.
@@ -2085,8 +2139,10 @@ pub enum Commands {
         /// Output format: `pretty`, `json` or `patch`.
         ///
         /// An unrecognised value is an error (exit 2), not a silent fall back
-        /// to `pretty` (I-074). `patch` lists add, remove and update lines; it
-        /// is not input for `patch(1)`.
+        /// to `pretty` (I-074). `patch` is a unified diff of the left file that
+        /// `patch -p1` applies: it adds the missing names and, when values are
+        /// compared, replaces the different ones. Keys only in the left file
+        /// are kept and named in comment lines.
         #[arg(long, default_value = "pretty", value_parser = ["pretty", "json", "patch"])]
         format: String,
 
@@ -2128,10 +2184,11 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         with_stats: bool,
 
-        /// Prompt for each change (`--format patch` only).
+        /// Prompt for each change and write the chosen ones (`--format patch`
+        /// only).
         ///
-        /// ⚠️ Nothing is written: the answers are listed, not applied (I-073,
-        /// planned for 0.12.0). Needs a terminal.
+        /// The previous file is kept as `.bak`. Needs a terminal. Not with
+        /// `--reverse`, which would write `.env`'s values into the template.
         #[arg(short, long, default_value_t = false)]
         interactive: bool,
     },
@@ -2706,6 +2763,62 @@ file, names that collide, a filter that leaves nothing).
         action: SpecAction,
     },
 
+    /// Run a command with a `.env`'s variables in its environment.
+    ///
+    /// The local `evnx cloud run`: the file is read and handed to the child
+    /// process in its environment block, never its arguments, so `ps` shows
+    /// the command and not the values, and the command never reads `.env`
+    /// itself. evnx's own `EVNX_*` settings are not passed on.
+    ///
+    /// The command runs directly, not through a shell. For a pipeline or a
+    /// builtin, ask for one: `-- sh -c 'a | b'`. Exits with the command's code.
+    #[command(after_help = docs::RUN.after_help)]
+    Run {
+        /// The file to read. Defaults to `.env`, or `[defaults] env_name`.
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Read `.env.<NAME>` instead of `.env`.
+        #[arg(long, value_name = "NAME", conflicts_with = "env")]
+        env_name: Option<String>,
+
+        /// Inject only variables whose name matches one of these globs.
+        #[arg(long, value_delimiter = ',', value_name = "GLOB")]
+        include: Option<Vec<String>>,
+
+        /// Skip variables whose name matches one of these globs.
+        #[arg(long, value_delimiter = ',', value_name = "GLOB")]
+        exclude: Option<Vec<String>>,
+
+        /// Inject variables that make a program load or run other code
+        /// (`PATH`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `BASH_ENV`, …), refused by
+        /// default.
+        #[arg(long)]
+        allow_unsafe_names: bool,
+
+        /// Mask secret values in the command's output as `***`.
+        ///
+        /// On by default when output is not a terminal (a CI log, an agent),
+        /// where what is printed is kept. Only values the classifier calls
+        /// secret (by name or by value) are masked. It prevents accidents, not
+        /// exfiltration: a command that transforms a value gets past it.
+        #[arg(long, conflicts_with = "no_mask")]
+        mask: bool,
+
+        /// Never mask the command's output.
+        #[arg(long)]
+        no_mask: bool,
+
+        /// The command to run, after `--`.
+        #[arg(
+            last = true,
+            required = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
+
     /// Every command this build has, and which features it was compiled with.
     ///
     /// ⚠️ "This build" is the point. `cloud`, `migrate` and `backup` are
@@ -2902,7 +3015,40 @@ pub enum SpecAction {
         #[arg(long, hide = true)]
         force: bool,
     },
+
+    /// Check the contract against `.env.example`, and `.env` when there is
+    /// one. Read-only; suited to a pre-commit hook and to CI.
+    ///
+    /// Every variable `[vars]` declares for every environment must be in the
+    /// template, and every name in the template must be declared. When `.env`
+    /// exists, every required variable must be in it. A project without
+    /// `[vars]` is skipped, and says so.
+    #[command(after_help = SPEC_CHECK_EXIT_CODES)]
+    Check {
+        /// The template to check. Defaults to `.env.example`, or
+        /// `[defaults] example` from `.evnx.toml`.
+        #[arg(long)]
+        example: Option<String>,
+
+        /// The environment file to check. Defaults to `.env`, or
+        /// `[defaults] env_name`. Skipped when it does not exist, unless named.
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Check `.env.<NAME>` instead of `.env`.
+        #[arg(long, value_name = "NAME", conflicts_with = "env")]
+        env_name: Option<String>,
+    },
 }
+
+/// `spec check --help`: what each exit code means (RM-41).
+const SPEC_CHECK_EXIT_CODES: &str = "\
+Exit codes:
+  0  the template and .env agree with [vars], or there is no [vars] (skipped)
+  1  they disagree: a name missing from the template, one it has that [vars]
+     does not declare, or a required variable missing from .env
+  2  no verdict: the template is missing or does not parse, or a file named
+     by --env or --env-name does not exist";
 
 /// `spec init --help`: what each exit code means (D-131).
 const SPEC_INIT_EXIT_CODES: &str = "\
