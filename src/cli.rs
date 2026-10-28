@@ -1913,7 +1913,9 @@ pub enum Commands {
         ///
         /// A folder is walked. A file named here is always read — whatever
         /// `--exclude`, `--extensions` or the size limit say — and always
-        /// reported in full, even one git ignores.
+        /// reported in full, even one git ignores. `-` reads stdin, in memory
+        /// (`git diff | evnx scan -`): as a `.env` when it parses as one,
+        /// otherwise as text. Empty stdin is an error, not a clean result.
         #[arg(default_value = ".")]
         path: Vec<String>,
 
@@ -2242,6 +2244,16 @@ Use 'evnx convert' without --to for interactive format selection.
         /// Examples: "*_DEBUG", "TEST_*"
         #[arg(long, value_name = "PATTERN", value_delimiter = ',')]
         exclude: Vec<String>,
+
+        /// Keep only the secrets, or only the rest
+        ///
+        /// A variable is a secret when its name says so (`*_PASSWORD`,
+        /// `*_SECRET`, `*_TOKEN`, …) or its value does (a provider key, a
+        /// private key, a URL with a password). Applied with --include and
+        /// --exclude. For example, public values to a build system and secrets
+        /// to a secret manager.
+        #[arg(long, value_enum, value_name = "WHICH")]
+        only: Option<crate::core::converter::Only>,
 
         /// Convert even when no variable is left (an empty .env, or filters
         /// that match nothing). Without it that is an error, exit 2.
