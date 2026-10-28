@@ -17,7 +17,7 @@
 # reading them would have broken Alpine installs.
 set -euo pipefail
 
-REPO="urwithajit9/evnx"
+REPO="conflux-fl/evnx"
 BINARY_NAME="evnx"
 
 # Colors
